@@ -44,11 +44,11 @@ class Config:
             except Exception:
                 self.settings["default_device"] = "/dev/sr0"
 
-        # Migrate away from SCSI "0,0,0" on Linux to a real /dev/srX
+        # Migrate away from deprecated/wrong formats (like SCSI IDs or non-sr* on Linux)
         try:
             if platform.system().lower() == "linux":
                 cur = str(self.settings.get("default_device") or "")
-                if re.match(r"^\d+,\d+,\d+$", cur):
+                if not cur.startswith("/dev/sr") or re.match(r"^\d+,\d+,\d+$", cur):
                     from .devices import DeviceScanner
                     devs = DeviceScanner().scan_devices()
                     if devs:
