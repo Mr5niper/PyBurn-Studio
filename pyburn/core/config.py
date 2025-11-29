@@ -1,5 +1,7 @@
 from __future__ import annotations
 import json
+import re
+import platform
 from pathlib import Path
 from typing import Any, Dict
 DEFAULT_CONFIG = {
@@ -32,6 +34,8 @@ class Config:
                     self.settings.update(data)
             except Exception:
                 pass
+
+        # Determine a default device if missing
         if not self.settings.get("default_device"):
             try:
                 from .devices import DeviceScanner
@@ -39,6 +43,19 @@ class Config:
                 self.settings["default_device"] = devs[0].id if devs else "/dev/sr0"
             except Exception:
                 self.settings["default_device"] = "/dev/sr0"
+
+        # Migrate away from SCSI "0,0,0" on Linux to a real /dev/srX
+        try:
+            if platform.system().lower() == "linux":
+                cur = str(self.settings.get("default_device") or "")
+                if re.match(r"^\d+,\d+,\d+$", cur):
+                    from .devices import DeviceScanner
+                    devs = DeviceScanner().scan_devices()
+                    if devs:
+                        self.settings["default_device"] = devs[0].id
+        except Exception:
+            pass
+
         Path(self.settings["temp_dir"]).mkdir(parents=True, exist_ok=True)
         Path(self.settings["logs_dir"]).mkdir(parents=True, exist_ok=True)
     def save(self):
