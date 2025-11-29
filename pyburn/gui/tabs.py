@@ -439,6 +439,30 @@ class RipCDTab(BaseTab):
         th.start()
         self._mb_thread = th  # hold ref
     def _start(self):
+        # Require cdparanoia for real ripping
+        missing = self.tools.missing(["cdparanoia"])
+        if missing:
+            if self.cfg.settings.get("simulate_when_missing_tools", True):
+                from PyQt6.QtWidgets import QMessageBox
+                r = QMessageBox.question(
+                    self,
+                    "Required Tool Missing",
+                    "The required tool 'cdparanoia' is not installed.\n\n"
+                    "Do you want to run a SIMULATED rip (for testing) instead?\n\n"
+                    "Choose No to cancel so you can install cdparanoia first.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if r != QMessageBox.StandardButton.Yes:
+                    return
+            else:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self,
+                    "Required Tool Missing",
+                    "The required tool 'cdparanoia' is not installed.\n"
+                    "Install it and try again."
+                )
+                return
         out = Path(self.ed_out.text())
         job = Job(
             job_type=JobType.RIP,
