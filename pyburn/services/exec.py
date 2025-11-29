@@ -48,10 +48,12 @@ class ProcessRunner:
         with self._lock:
             if self._cancelled and proc.poll() is None:
                 try:
-                    proc.kill()
-                    proc.wait(timeout=2)
+                    self._proc.terminate()
                 except Exception:
-                    pass
+                    try:
+                        self._proc.kill()
+                    except Exception:
+                        pass
         if check and code != 0 and not self._cancelled:
             raise subprocess.CalledProcessError(code, args)
         return code
