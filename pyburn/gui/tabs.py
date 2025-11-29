@@ -395,6 +395,7 @@ class RipCDTab(BaseTab):
         self.cbo_fmt = QComboBox(); self.cbo_fmt.addItems(["MP3", "FLAC", "WAV"])
         self.cbo_fmt.setCurrentText(str(self.cfg.settings.get("audio_format", "MP3")))
         self.sp_bitrate = QSpinBox(); self.sp_bitrate.setRange(128, 320); self.sp_bitrate.setValue(int(self.cfg.settings.get("audio_bitrate", 320)))
+        self.sp_bitrate.setAccelerated(True)
         self.ed_out = QLineEdit(str(Path.home() / "Music")); self.ed_out.setReadOnly(True)
         b_out = QPushButton("Browse"); b_out.clicked.connect(self._choose)
         row = QHBoxLayout(); row.addWidget(self.ed_out); row.addWidget(b_out)
