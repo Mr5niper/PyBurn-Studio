@@ -1,4 +1,3 @@
-```markdown
 # PyBurn Studio - Changelog
 
 ## [1.7.2] – 2025-01-XX – Final polish and edge case hardening
@@ -260,4 +259,5 @@ PyBurn Studio is developed using modern Python practices with PyQt6 for the GUI 
 ---
 
 **End of Changelog**
+
 ```
