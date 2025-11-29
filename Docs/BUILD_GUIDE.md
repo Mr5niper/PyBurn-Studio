@@ -1,4 +1,3 @@
-```markdown
 # PyBurn Studio - Build and Distribution Guide
 
 ## Overview
@@ -496,4 +495,5 @@ After successful build:
 2. Upload to GitHub Releases or your distribution platform
 3. Provide installation instructions for system tools
 4. Consider creating platform-specific packages (.deb, .rpm, .dmg)
+
 5. Sign executables if distributing publicly (especially macOS/Windows)
