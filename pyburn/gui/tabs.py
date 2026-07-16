@@ -12,7 +12,7 @@ from PyQt6.QtGui import QFont
 from ..core.config import Config
 from ..core.jobs import Job, JobOptions, JobType
 from ..core.tools import ToolFinder
-from .widgets import FileListWidget, CapacityGauge, compute_total_size
+from .widgets import FileListWidget, CapacityGauge, compute_total_size, compute_total_duration
 from ..services.queue import JobQueueService
 from ..services.metadata import musicbrainz_lookup
 from ..services.media import MediaTools
@@ -239,7 +239,7 @@ class AudioCDTab(BaseTab):
         self.btn_guess = QPushButton("Guess Track Titles From Filenames")
         self.btn_guess.clicked.connect(self._guess_titles)
         lay.addWidget(self.btn_guess)
-        self.gauge = CapacityGauge(CD_BYTES)
+        self.gauge = CapacityGauge(CD_BYTES, mode="minutes", max_minutes=80.0)
         lay.addWidget(self.gauge)
         self.chk_eject = QCheckBox("Eject after burn")
         self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
@@ -280,7 +280,43 @@ class AudioCDTab(BaseTab):
             QMessageBox.information(self, "CD-Text", f"Generated {len(self.track_titles)} track titles.")
 
     def _refresh(self, files: List[str]):
-        self.gauge.update_size(compute_total_size(files))
+        # Audio CDs are limited by playback time, not bytes. Compute total
+        # duration with ffprobe in a background thread so dropping in a full
+        # album does not freeze the UI. Fall back to a rough estimate if ffprobe
+        # is unavailable.
+        ffprobe = self.tools.find("ffprobe")
+        file_list = list(files)
+        if not file_list:
+            self.gauge.update_duration(0.0)
+            return
+
+        class DurThread(QThread):
+            done = pyqtSignal(float)
+
+            def __init__(self, paths, probe):
+                super().__init__()
+                self.paths = paths
+                self.probe = probe
+
+            def run(self):
+                secs = compute_total_duration(self.paths, self.probe)
+                self.done.emit(secs)
+
+        snapshot = file_list
+
+        def on_done(secs):
+            if secs and secs > 0:
+                self.gauge.update_duration(secs)
+            else:
+                # No ffprobe or probing failed: estimate from typical CD audio
+                # rate (about 10 MB per minute) so the gauge is at least in the
+                # right ballpark rather than reading far too low off MP3 bytes.
+                est_seconds = compute_total_size(snapshot) / (10 * 1024 * 1024) * 60.0
+                self.gauge.update_duration(est_seconds)
+
+        self._dur_thread = DurThread(file_list, ffprobe)
+        self._dur_thread.done.connect(on_done)
+        self._dur_thread.start()
 
     def _add(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Select Audio Files", "", "Audio (*.mp3 *.wav *.flac *.ogg *.m4a *.aac)")
@@ -300,10 +336,19 @@ class AudioCDTab(BaseTab):
         if self.track_titles and len(self.track_titles) != cnt:
             QMessageBox.warning(self, "CD-Text", "Track titles count does not match number of files.")
             return
+        # Warn if total playback time exceeds the disc (audio CDs hold ~80 min).
+        if self.gauge.current_seconds > self.gauge.max_minutes * 60.0:
+            r = QMessageBox.question(
+                self, "Over Capacity",
+                f"Total playback time is {int(self.gauge.current_seconds // 60)} min, which "
+                f"exceeds the {int(self.gauge.max_minutes)}-minute audio CD limit.\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                return
         temp_dir = Path(self.cfg.settings["temp_dir"])
-        needed = max(1, self.gauge.current_size)
+        # Temp space for decoding: CD audio is ~10 MB/min, so size by duration.
+        needed = max(1, int((self.gauge.current_seconds / 60.0) * 10 * 1024 * 1024))
         free = disk_free_bytes(temp_dir)
-        # Audio conversion slack ~1.5x
         if free < needed * 1.5:
             r = QMessageBox.question(self, "Low Temp Space",
                                      "Audio conversion may need extra temp space.\nContinue?",
