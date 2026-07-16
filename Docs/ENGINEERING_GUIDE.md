@@ -59,11 +59,25 @@ Services (`pyburn/services/`), where the work happens:
 - `exec.py` (ProcessRunner) runs one external process, streams stdout and
   stderr through pump threads, and supports cancel.
 - `backend.py` holds RealBackend and SimulatedBackend with one method per disc
-  type, plus the CD-Text TOC writer.
+  type, plus the CD-Text TOC writer. This is the Linux/CLI path.
+- `platform_caps.py` holds the engine routing. The Engine enum lists the ways a
+  step can run (CLI, IMAPI2, IOCTL, WSL, SIM, NONE). CapabilityResolver decides,
+  per job type and platform, which engine handles the job and reports why.
+  WSLManager detects WSL2, installs a distro, provisions the Linux tools, runs
+  commands inside the distro, and translates Windows paths to /mnt form.
+- `imapi2_backend.py` is the native Windows burning backend (data, ISO, audio,
+  blank, eject) via comtypes. No external tools.
+- `ioctl_ripper.py` is the native Windows CD ripper via DeviceIoControl, with
+  ffmpeg encoding when present.
+- `wsl_backend.py` authors DVD (dvdauthor) and Blu-ray (tsMuxeR) images inside
+  WSL2 and hands the finished image to IMAPI2 to burn.
+- `installer.py` downloads ffmpeg into a local tools folder, runs the elevated
+  WSL2 install, and fetches tsMuxeR into the distro.
 - `queue.py` (JobQueueService) owns the single-job-at-a-time queue and the
-  worker-thread lifecycle.
-- `burn.py` (BurnWorker) is the QObject moved onto a worker thread that runs one
-  job and emits status, progress, log, and finished signals.
+  worker-thread lifecycle, and shares one WSLManager with every worker.
+- `burn.py` (BurnWorker) is the QObject moved onto a worker thread that resolves
+  the engine for one job, dispatches to the matching backend, and emits status,
+  progress, log, and finished signals.
 - `progress.py` (ProgressTools) parses tool output into a percent.
 - `media.py` (MediaTools) reads media info and resolves burn speed, blank, and
   eject.
@@ -71,17 +85,31 @@ Services (`pyburn/services/`), where the work happens:
   listing compare.
 - `metadata.py` does the optional MusicBrainz lookup.
 
+Per-platform engine routing (the heart of the cross-platform design):
+- Linux and macOS: every job runs through the CLI backend (backend.py), exactly
+  as before. Nothing about the Linux path changed.
+- Windows: data disc, audio CD, blank, media info, and eject run through IMAPI2;
+  ripping runs through IOCTL; Video DVD and Blu-ray author inside WSL2 and are
+  then burned by IMAPI2. If a native Windows CLI tool build happens to be
+  present it is preferred, otherwise the native API path is used.
+- When no path exists for a job on the current machine (for example DVD/BD with
+  no WSL2), the resolver returns NONE and the worker fails the job with a clear
+  message instead of pretending to succeed.
+
 GUI (`pyburn/gui/`), everything on screen:
-- `main_window.py` builds the window, the tabs, and the queue/history panels.
+- `main_window.py` builds the window, the tabs, and the queue/history panels,
+  and hosts the Setup button and first-run setup.
 - `tabs.py` has the five tabs; each builds a Job and enqueues it.
 - `widgets.py` has the file list, capacity gauge, queue table, and history view.
-- `dialogs.py` has Settings and the job log window.
+- `dialogs.py` has Settings, the job log window, and the Setup dialog (capability
+  report, ffmpeg download, and the one-click Enable DVD/Blu-ray WSL2 flow).
 - `style.py` holds the dark theme stylesheet.
 
 Data flow for a burn: a tab builds a Job and calls `queue.enqueue`. The queue
-starts a QThread with a BurnWorker. The worker selects RealBackend or
-SimulatedBackend, runs the job, and emits signals. The queue records history,
-writes the per-job log, and advances to the next job.
+starts a QThread with a BurnWorker. The worker asks CapabilityResolver which
+engine to use, dispatches to that backend (CLI, IMAPI2, IOCTL, WSL, or the
+simulated backend), and emits signals. The queue records history, writes the
+per-job log, and advances to the next job.
 
 ## 3) The queue and threading model (read before touching queue.py)
 

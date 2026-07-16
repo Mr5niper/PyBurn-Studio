@@ -243,21 +243,32 @@ class SetupDialog(QDialog):
         if self._busy:
             return
         wsl = self.queue.wsl
-        wsl.detect()
 
-        # Case 1: WSL platform entirely absent -> needs the elevated one-time step.
+        def setup_log(s):
+            self.report.append(s)
+            try:
+                import os, sys, datetime
+                base = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) else os.getcwd()
+                with open(os.path.join(base, "pyburn_setup.log"), "a", encoding="utf-8") as f:
+                    f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')}  {s}\n")
+            except Exception:
+                pass
+
+        wsl.detect(on_log=setup_log)
+
+        # Case 1: WSL feature absent -> run the elevated one-time install.
         if not wsl.info.platform_present:
             r = QMessageBox.question(
-                self, "Enable WSL2",
-                "Windows needs to enable the WSL2 feature first. The app will start "
-                "that now; approve the Windows security prompt. When it finishes you "
-                "must REBOOT once, then open Setup and click this button again to "
-                "finish automatically.\n\nProceed?",
+                self, "Install WSL2",
+                "WSL2 is not installed on this machine. The app will run the "
+                "Windows installer for it now; approve the Windows security "
+                "prompt. When it finishes you must REBOOT once, then open Setup "
+                "and click this button again to finish automatically.\n\nProceed?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if r != QMessageBox.StandardButton.Yes:
                 return
-            self.report.append("<br><b>Enabling WSL2 (approve the prompt, then reboot)...</b><br>")
-            launch_wsl_install_elevated(on_log=lambda s: self.report.append(s))
+            self.report.append("<br><b>Installing WSL2 (approve the prompt, then reboot)...</b><br>")
+            launch_wsl_install_elevated(on_log=setup_log)
             QMessageBox.information(self, "Reboot needed",
                                    "When WSL2 finishes installing, REBOOT, then open Setup and "
                                    "click Enable DVD/Blu-ray (WSL2) again.")
@@ -274,6 +285,7 @@ class SetupDialog(QDialog):
         class SetupThread(QThread):
             logline = pyqtSignal(str)
             done = pyqtSignal(bool, str)
+            need_feature_install = pyqtSignal()
 
             def run(self):
                 def log(s):
@@ -284,10 +296,16 @@ class SetupDialog(QDialog):
                         log("No Linux distribution found; installing Ubuntu (this downloads a few hundred MB)...")
                         ok = wsl.install_distro("Ubuntu", on_log=log)
                         if not ok:
+                            # If the distro step failed because the WSL feature
+                            # itself is not installed, ask the main thread to run
+                            # the elevated feature install (UAC must be on the UI
+                            # thread).
+                            if getattr(wsl, "_feature_absent", False):
+                                self.need_feature_install.emit()
+                                return
                             self.done.emit(False,
                                 "Could not install a WSL2 distribution automatically. "
-                                "This is usually corporate policy blocking the download. "
-                                "See the log for the distros your machine allows.")
+                                "See pyburn_setup.log next to the program for the exact reason.")
                             return
                     # Install the apt toolchain (root, non-interactive).
                     log("Installing Linux disc tools...")
@@ -309,20 +327,56 @@ class SetupDialog(QDialog):
 
         def on_log(s):
             self.report.append(s)
+            # Also write every line to a log file next to the exe so a failed
+            # run can be diagnosed from the file instead of a screenshot.
+            try:
+                import os, sys, datetime
+                base = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) else os.getcwd()
+                with open(os.path.join(base, "pyburn_setup.log"), "a", encoding="utf-8") as f:
+                    f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')}  {s}\n")
+            except Exception:
+                pass
 
         def on_done(ok, msg):
             self._busy = False
             self.btn_ffmpeg.setEnabled(True)
             self.btn_dvdbd.setEnabled(True)
+            # Record the final result line too.
+            try:
+                import os, sys, datetime
+                base = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) else os.getcwd()
+                with open(os.path.join(base, "pyburn_setup.log"), "a", encoding="utf-8") as f:
+                    f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')}  RESULT ok={ok}: {msg}\n")
+            except Exception:
+                pass
             if ok:
                 QMessageBox.information(self, "DVD/Blu-ray", msg)
             else:
-                QMessageBox.warning(self, "DVD/Blu-ray", msg)
+                QMessageBox.warning(self, "DVD/Blu-ray", msg + "\n\nA full log was written to pyburn_setup.log next to the program.")
             self.refresh()
+
+        def on_need_feature_install():
+            self._busy = False
+            self.btn_ffmpeg.setEnabled(True)
+            self.btn_dvdbd.setEnabled(True)
+            r = QMessageBox.question(
+                self, "Install WSL2",
+                "The Linux distribution could not be installed because the WSL2 "
+                "Windows feature is not installed yet. The app will run the "
+                "Windows installer for it now; approve the security prompt, then "
+                "REBOOT once and click Enable DVD/Blu-ray (WSL2) again.\n\nProceed?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if r == QMessageBox.StandardButton.Yes:
+                self.report.append("<br><b>Installing WSL2 (approve the prompt, then reboot)...</b><br>")
+                launch_wsl_install_elevated(on_log=setup_log)
+                QMessageBox.information(self, "Reboot needed",
+                                       "When WSL2 finishes installing, REBOOT, then open Setup "
+                                       "and click Enable DVD/Blu-ray (WSL2) again.")
 
         self._setup_thread = SetupThread()
         self._setup_thread.logline.connect(on_log)
         self._setup_thread.done.connect(on_done)
+        self._setup_thread.need_feature_install.connect(on_need_feature_install)
         self._setup_thread.start()
 
     def _download_ffmpeg(self):
