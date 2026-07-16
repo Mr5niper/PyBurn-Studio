@@ -4,12 +4,16 @@ from enum import Enum
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+
+
 class JobType(str, Enum):
     DATA = "data"
     AUDIO = "audio"
     VIDEO_DVD = "video_dvd"
     VIDEO_BD = "video_bd"
     RIP = "rip"
+
+
 @dataclass
 class JobOptions:
     temp_dir: Path
@@ -26,6 +30,8 @@ class JobOptions:
     album_performer: Optional[str] = None
     track_titles: Optional[List[str]] = None
     track_performers: Optional[List[str]] = None
+
+
 @dataclass
 class Job:
     job_type: JobType
@@ -36,6 +42,7 @@ class Job:
     status: str = "PENDING"
     progress: int = 0
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
@@ -49,6 +56,7 @@ class Job:
             },
             "created_at": self.created_at,
         }
+
     @property
     def display_name(self) -> str:
         if self.job_type == JobType.DATA:

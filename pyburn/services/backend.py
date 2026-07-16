@@ -10,18 +10,37 @@ from ..core.tools import ToolFinder
 from .progress import ProgressTools
 from .media import MediaTools
 from .verify import VerificationTools
+
 OnStatus = Callable[[str], None]
 OnProgress = Callable[[int], None]
 OnLog = Callable[[str], None]
+
+
+def _toc_escape(text: str) -> str:
+    """Escape a string for inclusion in a cdrdao .toc CD-TEXT field.
+
+    cdrdao TOC strings are double-quoted, so a literal double quote or
+    backslash in a title or performer would otherwise break parsing and make
+    the whole burn fail. Backslash must be escaped first so the backslashes
+    added for quotes are not themselves doubled.
+    """
+    if text is None:
+        return ""
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
 class Phase:
     def __init__(self, on_progress: OnProgress, start: int, span: int):
         self.on_progress = on_progress
         self.start = start
         self.span = span
+
     def emit(self, pct: int):
         pct = max(0, min(100, pct))
         overall = self.start + int(self.span * (pct / 100.0))
         self.on_progress(min(99, overall))
+
+
 class BackendBase:
     def __init__(self, tools: ToolFinder):
         self.tools = tools
@@ -29,39 +48,59 @@ class BackendBase:
         self.media = MediaTools(tools, self.runner)
         self.verify = VerificationTools(tools, self.runner)
         self._cancelled = False
+
     def cancel(self):
         self._cancelled = True
         self.runner.cancel()
+
     def _file_total_size(self, paths: List[Path]) -> int:
         total = 0
         for p in paths:
             if p.is_file():
-                try: total += p.stat().st_size
-                except Exception: pass
+                try:
+                    total += p.stat().st_size
+                except Exception:
+                    pass
             elif p.is_dir():
                 for root, _, files in os.walk(p, followlinks=False):
                     for fn in files:
                         fp = Path(root) / fn
-                        try: total += fp.stat().st_size
-                        except Exception: pass
+                        try:
+                            total += fp.stat().st_size
+                        except Exception:
+                            pass
         return total
+
+
 class SimulatedBackend(BackendBase):
     def burn_data(self, files: List[Path], device: str, temp_dir: Path, volume: str, speed: any,
                   verify: bool, on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
                   auto_blank: bool = True, eject_after: bool = True, dummy: bool = False):
         on_status("Creating ISO image (simulated)...")
         for i in range(40):
-            if self.runner.cancelled: raise RuntimeError("cancelled")
-            import time; time.sleep(0.02); on_progress(i)
+            if self.runner.cancelled:
+                raise RuntimeError("cancelled")
+            import time
+            time.sleep(0.02)
+            on_progress(i)
         on_status("Burning (simulated)...")
         for i in range(50):
-            if self.runner.cancelled: raise RuntimeError("cancelled")
-            import time; time.sleep(0.03); on_progress(40 + i)
+            if self.runner.cancelled:
+                raise RuntimeError("cancelled")
+            import time
+            time.sleep(0.03)
+            on_progress(40 + i)
         if verify:
             on_status("Verifying (simulated)...")
-            for i in range(10): import time; time.sleep(0.02); on_progress(90 + i)
-        if eject_after: on_status("Ejecting (simulated)...")
-        on_progress(100); on_status("Data disc burned (simulated)")
+            for i in range(10):
+                import time
+                time.sleep(0.02)
+                on_progress(90 + i)
+        if eject_after:
+            on_status("Ejecting (simulated)...")
+        on_progress(100)
+        on_status("Data disc burned (simulated)")
+
     def burn_audio(self, files: List[Path], device: str, temp_dir: Path, speed: any,
                    on_status: OnStatus, on_progress: OnProgress, on_log: OnLog, eject_after: bool = True,
                    album_title: Optional[str] = None, album_performer: Optional[str] = None,
@@ -69,12 +108,21 @@ class SimulatedBackend(BackendBase):
         on_status("Converting audio (simulated)...")
         n = max(1, len(files))
         for idx in range(1, n + 1):
-            if self.runner.cancelled: raise RuntimeError("cancelled")
-            import time; time.sleep(0.05); on_progress(10 + int((idx / n) * 40))
+            if self.runner.cancelled:
+                raise RuntimeError("cancelled")
+            import time
+            time.sleep(0.05)
+            on_progress(10 + int((idx / n) * 40))
         on_status("Burning (simulated)...")
-        for i in range(50): import time; time.sleep(0.03); on_progress(50 + i)
-        if eject_after: on_status("Ejecting (simulated)...")
-        on_progress(100); on_status("Audio CD created (simulated)")
+        for i in range(50):
+            import time
+            time.sleep(0.03)
+            on_progress(50 + i)
+        if eject_after:
+            on_status("Ejecting (simulated)...")
+        on_progress(100)
+        on_status("Audio CD created (simulated)")
+
     def burn_video_dvd(self, files: List[Path], device: str, temp_dir: Path, speed: any,
                        on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
                        auto_blank: bool = True, eject_after: bool = True):
@@ -82,37 +130,68 @@ class SimulatedBackend(BackendBase):
         n = max(1, len(files))
         for idx in range(1, n + 1):
             for i in range(10):
-                if self.runner.cancelled: raise RuntimeError("cancelled")
-                import time; time.sleep(0.04); on_progress(min(60, 10 + int((idx - 1 + i / 10) / n * 50)))
-        on_status("Authoring DVD (simulated)..."); on_progress(70); import time; time.sleep(0.4)
+                if self.runner.cancelled:
+                    raise RuntimeError("cancelled")
+                import time
+                time.sleep(0.04)
+                on_progress(min(60, 10 + int((idx - 1 + i / 10) / n * 50)))
+        on_status("Authoring DVD (simulated)...")
+        on_progress(70)
+        import time
+        time.sleep(0.4)
         on_status("Burning DVD (simulated)...")
-        for i in range(30): time.sleep(0.05); on_progress(70 + i)
-        if eject_after: on_status("Ejecting (simulated)...")
-        on_progress(100); on_status("Video DVD created (simulated)")
+        for i in range(30):
+            time.sleep(0.05)
+            on_progress(70 + i)
+        if eject_after:
+            on_status("Ejecting (simulated)...")
+        on_progress(100)
+        on_status("Video DVD created (simulated)")
+
     def burn_video_bd(self, files: List[Path], device: str, temp_dir: Path, speed: any,
                       on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
                       auto_blank: bool = True, eject_after: bool = True):
         on_status("Transcoding for BDMV (simulated)...")
         n = max(1, len(files))
         for idx in range(1, n + 1):
-            for i in range(10): import time; time.sleep(0.05); on_progress(min(60, 10 + int((idx - 1 + i / 10) / n * 50)))
-        on_status("Authoring BDMV (simulated)..."); on_progress(70); import time; time.sleep(0.4)
+            for i in range(10):
+                if self.runner.cancelled:
+                    raise RuntimeError("cancelled")
+                import time
+                time.sleep(0.05)
+                on_progress(min(60, 10 + int((idx - 1 + i / 10) / n * 50)))
+        on_status("Authoring BDMV (simulated)...")
+        on_progress(70)
+        import time
+        time.sleep(0.4)
         on_status("Burning Blu-ray (simulated)...")
-        for i in range(30): time.sleep(0.05); on_progress(70 + i)
-        if eject_after: on_status("Ejecting (simulated)...")
-        on_progress(100); on_status("Blu-ray created (simulated)")
+        for i in range(30):
+            time.sleep(0.05)
+            on_progress(70 + i)
+        if eject_after:
+            on_status("Ejecting (simulated)...")
+        on_progress(100)
+        on_status("Blu-ray created (simulated)")
+
     def rip_cd(self, device: str, out_dir: Path, fmt: str, bitrate: int,
                on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
                track_titles: Optional[List[str]] = None):
         on_status("Detecting tracks (simulated)...")
-        import time; time.sleep(0.2)
+        import time
+        time.sleep(0.2)
         tracks = 10
         for t in range(1, tracks + 1):
+            if self.runner.cancelled:
+                raise RuntimeError("cancelled")
             on_status(f"Ripping track {t}/{tracks} (simulated)...")
             time.sleep(0.06)
-            if fmt != "WAV": time.sleep(0.04)
+            if fmt != "WAV":
+                time.sleep(0.04)
             on_progress(int(5 + (t / tracks) * 95))
-        on_progress(100); on_status(f"Ripped {tracks} tracks to {out_dir} (simulated)")
+        on_progress(100)
+        on_status(f"Ripped {tracks} tracks to {out_dir} (simulated)")
+
+
 class RealBackend(BackendBase):
     def burn_data(self, files: List[Path], device: str, temp_dir: Path, volume: str, speed: any,
                   verify: bool, on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
@@ -147,7 +226,8 @@ class RealBackend(BackendBase):
             else:
                 rec = self.tools.require("cdrecord")
                 cmd = [rec, f"dev={device}", f"speed={speed_val}", "-v", "-dao"]
-                if dummy: cmd.append("-dummy")
+                if dummy:
+                    cmd.append("-dummy")
                 cmd.append(str(iso_path))
                 self.runner.run_stream(cmd, on_stdout=lambda s: (on_log(s), phase2.emit(ProgressTools.parse_cdrecord(s) or 0)),
                                        on_stderr=lambda s: (on_log(s), phase2.emit(ProgressTools.parse_cdrecord(s) or 0)), check=True)
@@ -162,12 +242,17 @@ class RealBackend(BackendBase):
                 raise RuntimeError("Data disc verification failed.")
             on_status("Data disc burned successfully")
         finally:
-            try: iso_path.unlink(missing_ok=True)
-            except Exception: pass
-            try: verify_iso.unlink(missing_ok=True)
-            except Exception: pass
+            try:
+                iso_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                verify_iso.unlink(missing_ok=True)
+            except Exception:
+                pass
             if eject_after:
                 self.media.eject(device)
+
     def _write_cdtext_toc(self, temp_audio: Path, n: int,
                           album_title: Optional[str], album_performer: Optional[str],
                           track_titles: Optional[List[str]], track_performers: Optional[List[str]]) -> Path:
@@ -176,21 +261,24 @@ class RealBackend(BackendBase):
             f.write("CD_DA\n\n")
             if album_title or album_performer:
                 f.write("CD_TEXT {\n")
-                if album_title: f.write(f'  LANGUAGE 0 {{"TITLE"="{album_title}"}}\n')
-                if album_performer: f.write(f'  LANGUAGE 0 {{"PERFORMER"="{album_performer}"}}\n')
+                if album_title:
+                    f.write(f'  LANGUAGE 0 {{"TITLE"="{_toc_escape(album_title)}"}}\n')
+                if album_performer:
+                    f.write(f'  LANGUAGE 0 {{"PERFORMER"="{_toc_escape(album_performer)}"}}\n')
                 f.write("}\n\n")
             for i in range(1, n + 1):
                 f.write("TRACK AUDIO\n")
                 if track_titles or track_performers:
                     f.write("CD_TEXT {\n")
-                    title = (track_titles[i-1] if track_titles and i-1 < len(track_titles) else f"Track {i}")
-                    performer = (track_performers[i-1] if track_performers and i-1 < len(track_performers) else (album_performer or ""))
-                    f.write(f'  LANGUAGE 0 {{"TITLE"="{title}"}}\n')
+                    title = (track_titles[i - 1] if track_titles and i - 1 < len(track_titles) else f"Track {i}")
+                    performer = (track_performers[i - 1] if track_performers and i - 1 < len(track_performers) else (album_performer or ""))
+                    f.write(f'  LANGUAGE 0 {{"TITLE"="{_toc_escape(title)}"}}\n')
                     if performer:
-                        f.write(f'  LANGUAGE 0 {{"PERFORMER"="{performer}"}}\n')
+                        f.write(f'  LANGUAGE 0 {{"PERFORMER"="{_toc_escape(performer)}"}}\n')
                     f.write("}\n")
                 f.write(f'FILE "track_{i:02d}.wav" 0\n\n')
         return toc
+
     def burn_audio(self, files: List[Path], device: str, temp_dir: Path, speed: any,
                    on_status: OnStatus, on_progress: OnProgress, on_log: OnLog, eject_after: bool = True,
                    album_title: Optional[str] = None, album_performer: Optional[str] = None,
@@ -212,17 +300,24 @@ class RealBackend(BackendBase):
             toc = self._write_cdtext_toc(temp_audio, n, album_title, album_performer, track_titles, track_performers)
             on_status("Burning audio CD...")
             phase = Phase(on_progress, 40, 60)
+            # cdrdao writes progress to stderr; parse it for a real bar instead
+            # of the old hardcoded 70/90 jumps.
             self.runner.run_stream([cdrdao, "write", "--device", device, "--speed", str(speed_val), toc.name],
                                    cwd=str(temp_audio),
-                                   on_stdout=lambda s: (on_log(s), phase.emit(70)),
-                                   on_stderr=lambda s: (on_log(s), phase.emit(90)), check=True)
+                                   on_stdout=on_log,
+                                   on_stderr=lambda s: (on_log(s), phase.emit(ProgressTools.parse_cdrdao(s) or 0)),
+                                   check=True)
             phase.emit(100)
-            on_progress(100); on_status("Audio CD created successfully")
+            on_progress(100)
+            on_status("Audio CD created successfully")
         finally:
-            try: shutil.rmtree(temp_audio, ignore_errors=True)
-            except Exception: pass
+            try:
+                shutil.rmtree(temp_audio, ignore_errors=True)
+            except Exception:
+                pass
             if eject_after:
                 self.media.eject(device)
+
     def burn_video_dvd(self, files: List[Path], device: str, temp_dir: Path, speed: any,
                        on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
                        auto_blank: bool = True, eject_after: bool = True):
@@ -237,7 +332,8 @@ class RealBackend(BackendBase):
         dvd_temp.mkdir(exist_ok=True)
         try:
             if auto_blank and info.get("rewritable") and info.get("blank") is False:
-                on_status("Blanking rewritable media..."); self.media.blank_media(device)
+                on_status("Blanking rewritable media...")
+                self.media.blank_media(device)
             mpegs: List[Path] = []
             n = max(1, len(files))
             for idx, src in enumerate(files, start=1):
@@ -273,12 +369,16 @@ class RealBackend(BackendBase):
                                        on_stdout=lambda s: (on_log(s), phase.emit(ProgressTools.parse_cdrecord(s) or 0)),
                                        on_stderr=lambda s: (on_log(s), phase.emit(ProgressTools.parse_cdrecord(s) or 0)), check=True)
             phase.emit(100)
-            on_progress(100); on_status("Video DVD created successfully")
+            on_progress(100)
+            on_status("Video DVD created successfully")
         finally:
-            try: shutil.rmtree(dvd_temp, ignore_errors=True)
-            except Exception: pass
+            try:
+                shutil.rmtree(dvd_temp, ignore_errors=True)
+            except Exception:
+                pass
             if eject_after:
                 self.media.eject(device)
+
     def burn_video_bd(self, files: List[Path], device: str, temp_dir: Path, speed: any,
                       on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
                       auto_blank: bool = True, eject_after: bool = True):
@@ -293,7 +393,8 @@ class RealBackend(BackendBase):
         bd_temp.mkdir(exist_ok=True)
         try:
             if auto_blank and info.get("rewritable") and info.get("blank") is False:
-                on_status("Blanking rewritable media..."); self.media.blank_media(device)
+                on_status("Blanking rewritable media...")
+                self.media.blank_media(device)
             ts_files: List[Path] = []
             n = max(1, len(files))
             for idx, src in enumerate(files, start=1):
@@ -327,7 +428,7 @@ class RealBackend(BackendBase):
             on_status("Burning Blu-ray...")
             if grow:
                 phase = Phase(on_progress, 85, 15)
-                self.runner.run_stream([grow, "-speed="+str(speed_val), "-Z", f"{device}={iso}"],
+                self.runner.run_stream([grow, "-speed=" + str(speed_val), "-Z", f"{device}={iso}"],
                                        on_stdout=lambda s: (on_log(s), phase.emit(ProgressTools.parse_growisofs(s) or 0)),
                                        on_stderr=on_log, check=True)
                 phase.emit(100)
@@ -339,10 +440,13 @@ class RealBackend(BackendBase):
                 on_progress(100)
             on_status("Blu-ray created successfully")
         finally:
-            try: shutil.rmtree(bd_temp, ignore_errors=True)
-            except Exception: pass
+            try:
+                shutil.rmtree(bd_temp, ignore_errors=True)
+            except Exception:
+                pass
             if eject_after:
                 self.media.eject(device)
+
     def rip_cd(self, device: str, out_dir: Path, fmt: str, bitrate: int,
                on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
                track_titles: Optional[List[str]] = None):
@@ -359,20 +463,24 @@ class RealBackend(BackendBase):
             self.runner.run_stream([cdparanoia, "-d", device, str(t), str(wav)],
                                    on_stdout=lambda s: (on_log(s), None),
                                    on_stderr=lambda s: (on_log(s), phase.emit(ProgressTools.parse_cdparanoia(s) or 0)), check=True)
-            out_name = f"{t:02d} - {track_titles[t-1] if track_titles and t-1 < len(track_titles) else f'Track {t}'}"
+            out_name = f"{t:02d} - {track_titles[t - 1] if track_titles and t - 1 < len(track_titles) else f'Track {t}'}"
             fmtu = fmt.upper()
             if fmtu == "MP3":
                 lame = self.tools.require("lame")
                 self.runner.run_stream([lame, "-b", str(bitrate), str(wav), str(out_dir / f"{out_name}.mp3")],
                                        on_stdout=on_log, on_stderr=on_log, check=True)
-                try: wav.unlink()
-                except Exception: pass
+                try:
+                    wav.unlink()
+                except Exception:
+                    pass
             elif fmtu == "FLAC":
                 flac = self.tools.require("flac")
                 self.runner.run_stream([flac, "-8", str(wav), "-o", str(out_dir / f"{out_name}.flac")],
                                        on_stdout=on_log, on_stderr=on_log, check=True)
-                try: wav.unlink()
-                except Exception: pass
+                try:
+                    wav.unlink()
+                except Exception:
+                    pass
             else:
                 wav.rename(out_dir / f"{out_name}.wav")
             on_progress(int(5 + (t / tracks) * 95))

@@ -2,11 +2,27 @@ from __future__ import annotations
 import subprocess
 import threading
 from typing import Callable, Optional, List
+
+
 class ProcessRunner:
+    """Runs a single external process at a time and streams its output.
+
+    One ProcessRunner is created per backend instance, and a fresh backend is
+    created per job, so the cancel flag never needs to survive across jobs.
+    reset() exists anyway so a runner can be reused safely if that ever
+    changes: a stale cancel flag would otherwise make every later run a no-op.
+    """
+
     def __init__(self):
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._cancelled = False
+
+    def reset(self):
+        """Clear the cancel flag so this runner can start fresh work."""
+        with self._lock:
+            self._cancelled = False
+
     def run_stream(
         self,
         args: List[str],
@@ -27,6 +43,7 @@ class ProcessRunner:
                 bufsize=1,
             )
             proc = self._proc  # capture under lock
+
         def pump(stream, cb):
             if not stream or not cb:
                 return
@@ -38,6 +55,7 @@ class ProcessRunner:
                 stream.close()
             except Exception:
                 pass
+
         t_out = threading.Thread(target=pump, args=(proc.stdout, on_stdout), daemon=True)
         t_err = threading.Thread(target=pump, args=(proc.stderr, on_stderr), daemon=True)
         t_out.start()
@@ -57,6 +75,7 @@ class ProcessRunner:
         if check and code != 0 and not self._cancelled:
             raise subprocess.CalledProcessError(code, args)
         return code
+
     def cancel(self):
         with self._lock:
             self._cancelled = True
@@ -68,6 +87,7 @@ class ProcessRunner:
                         self._proc.kill()
                     except Exception:
                         pass
+
     @property
     def cancelled(self) -> bool:
         return self._cancelled

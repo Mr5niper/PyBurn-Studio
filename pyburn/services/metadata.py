@@ -2,6 +2,8 @@ from __future__ import annotations
 import subprocess
 from typing import Optional, Dict, List
 from ..core.tools import ToolFinder
+
+
 def musicbrainz_lookup(tools: ToolFinder, device: str) -> Optional[Dict]:
     cd_discid = tools.find("cd-discid")
     if not cd_discid:
