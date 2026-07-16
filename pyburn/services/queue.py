@@ -5,6 +5,7 @@ from ..core.jobs import Job, JobType, JobOptions
 from ..core.tools import ToolFinder
 from ..core.history import HistoryStore, HistoryEntry
 from .burn import BurnWorker
+from .platform_caps import WSLManager, is_windows
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +21,11 @@ class JobQueueService(QObject):
         super().__init__()
         self.tools = tools
         self.settings = settings
+        # Detect WSL2 once (Windows only) and share it with every worker so we
+        # do not re-probe on each job.
+        self.wsl = WSLManager()
+        if is_windows():
+            self.wsl.detect()
         self._queue: List[Job] = []
         self._thread: Optional[QThread] = None
         self._worker: Optional[BurnWorker] = None
@@ -92,7 +98,7 @@ class JobQueueService(QObject):
         job.status = "RUNNING"
         job.progress = 0
         self._log_lines = []
-        self._worker = BurnWorker(job, self.tools, simulate_if_missing=self.settings.get("simulate_when_missing_tools", True))
+        self._worker = BurnWorker(job, self.tools, simulate_if_missing=self.settings.get("simulate_when_missing_tools", True), wsl=self.wsl)
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
         self._worker.sig_status.connect(lambda s: self._status(job.id, s))

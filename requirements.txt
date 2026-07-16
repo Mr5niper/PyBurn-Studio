@@ -4,6 +4,8 @@ PyQt6==6.9.1
 PyQt6-Qt6==6.9.1
 PyQt6-sip==13.10.2
 
+comtypes==1.4.13
+
 pyinstaller==6.16.0
 pyinstaller-hooks-contrib==2025.9
 altgraph==0.17.4
