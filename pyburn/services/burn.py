@@ -124,19 +124,41 @@ class BurnWorker(QObject):
     def _run_imapi2(self):
         from .imapi2_backend import IMAPI2Backend
         o = self.job.options
-        self._backend = IMAPI2Backend()
-        if self.job.job_type == JobType.DATA:
-            self._backend.burn_data(self.job.files, self.job.device, o.temp_dir, o.volume_label,
-                                    self.sig_status.emit, self.sig_progress.emit, self.sig_log.emit,
-                                    auto_blank=o.auto_blank, eject_after=o.eject_after)
-            self.sig_finished.emit(True, "Data disc burned successfully (IMAPI2)")
-        elif self.job.job_type == JobType.AUDIO:
-            wavs = self._decode_audio_to_wav(self.job.files, o.temp_dir)
-            self._backend.burn_audio(wavs, self.job.device, self.sig_status.emit,
-                                     self.sig_progress.emit, self.sig_log.emit, eject_after=o.eject_after)
-            self.sig_finished.emit(True, "Audio CD created successfully (IMAPI2)")
-        else:
-            self.sig_finished.emit(False, f"IMAPI2 does not handle {self.job.job_type.value}")
+        # CRITICAL: this method runs on a Qt worker thread, not the GUI thread.
+        # COM objects (IMAPI2 via comtypes) can only be created on a thread that
+        # has initialized a COM apartment. The GUI thread gets one from Qt, but
+        # this worker thread does not, so without CoInitialize here the first
+        # CreateObject call hangs forever, which looked like "decode finishes,
+        # then it just sits there". Initialize COM for this thread, and
+        # uninitialize when done.
+        _com_ready = False
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+            _com_ready = True
+        except Exception as e:
+            self.sig_log.emit(f"COM init warning: {e}")
+        try:
+            self._backend = IMAPI2Backend()
+            if self.job.job_type == JobType.DATA:
+                self._backend.burn_data(self.job.files, self.job.device, o.temp_dir, o.volume_label,
+                                        self.sig_status.emit, self.sig_progress.emit, self.sig_log.emit,
+                                        auto_blank=o.auto_blank, eject_after=o.eject_after)
+                self.sig_finished.emit(True, "Data disc burned successfully (IMAPI2)")
+            elif self.job.job_type == JobType.AUDIO:
+                wavs = self._decode_audio_to_wav(self.job.files, o.temp_dir)
+                self._backend.burn_audio(wavs, self.job.device, self.sig_status.emit,
+                                         self.sig_progress.emit, self.sig_log.emit, eject_after=o.eject_after)
+                self.sig_finished.emit(True, "Audio CD created successfully (IMAPI2)")
+            else:
+                self.sig_finished.emit(False, f"IMAPI2 does not handle {self.job.job_type.value}")
+        finally:
+            if _com_ready:
+                try:
+                    import comtypes
+                    comtypes.CoUninitialize()
+                except Exception:
+                    pass
 
     def _decode_audio_to_wav(self, files, temp_dir: Path):
         # IMAPI2 audio wants 44100/16/stereo WAV. Use native ffmpeg if present,
@@ -180,19 +202,36 @@ class BurnWorker(QObject):
     def _run_wsl_author(self):
         from .wsl_backend import WSLAuthorBackend
         o = self.job.options
-        self._backend = WSLAuthorBackend(self.resolver.wsl)
-        if self.job.job_type == JobType.VIDEO_DVD:
-            self._backend.burn_video_dvd(self.job.files, self.job.device, self.sig_status.emit,
-                                        self.sig_progress.emit, self.sig_log.emit,
-                                        auto_blank=o.auto_blank, eject_after=o.eject_after)
-            self.sig_finished.emit(True, "Video DVD created successfully (WSL2 author + IMAPI2 burn)")
-        elif self.job.job_type == JobType.VIDEO_BD:
-            self._backend.burn_video_bd(self.job.files, self.job.device, self.sig_status.emit,
-                                       self.sig_progress.emit, self.sig_log.emit,
-                                       auto_blank=o.auto_blank, eject_after=o.eject_after)
-            self.sig_finished.emit(True, "Blu-ray created successfully (WSL2 author + IMAPI2 burn)")
-        else:
-            self.sig_finished.emit(False, f"WSL path does not handle {self.job.job_type.value}")
+        # The burn half of this path uses IMAPI2 (COM) on this worker thread, so
+        # the COM apartment must be initialized here too (see _run_imapi2).
+        _com_ready = False
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+            _com_ready = True
+        except Exception as e:
+            self.sig_log.emit(f"COM init warning: {e}")
+        try:
+            self._backend = WSLAuthorBackend(self.resolver.wsl)
+            if self.job.job_type == JobType.VIDEO_DVD:
+                self._backend.burn_video_dvd(self.job.files, self.job.device, self.sig_status.emit,
+                                            self.sig_progress.emit, self.sig_log.emit,
+                                            auto_blank=o.auto_blank, eject_after=o.eject_after)
+                self.sig_finished.emit(True, "Video DVD created successfully (WSL2 author + IMAPI2 burn)")
+            elif self.job.job_type == JobType.VIDEO_BD:
+                self._backend.burn_video_bd(self.job.files, self.job.device, self.sig_status.emit,
+                                           self.sig_progress.emit, self.sig_log.emit,
+                                           auto_blank=o.auto_blank, eject_after=o.eject_after)
+                self.sig_finished.emit(True, "Blu-ray created successfully (WSL2 author + IMAPI2 burn)")
+            else:
+                self.sig_finished.emit(False, f"WSL path does not handle {self.job.job_type.value}")
+        finally:
+            if _com_ready:
+                try:
+                    import comtypes
+                    comtypes.CoUninitialize()
+                except Exception:
+                    pass
 
     def cancel(self):
         if self._backend is not None and hasattr(self._backend, "cancel"):

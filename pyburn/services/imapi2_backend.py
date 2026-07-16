@@ -265,6 +265,7 @@ class IMAPI2Backend:
         per-track loop, which throws a COM error after the first track and
         aborted the burn.)
         """
+        on_status("Connecting to burner (IMAPI2)...")
         recorder = self._recorder_for(device)
         try:
             tao = self._new("IMAPI2.MsftDiscFormat2TrackAtOnce")
