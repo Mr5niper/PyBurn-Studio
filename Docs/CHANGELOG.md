@@ -49,10 +49,36 @@ with no manual tool hunting.
   every command-line tool marked present or missing. On Windows this reflects
   the real native and WSL2 paths, so features that work no longer read as
   errors.
-- Enabling WSL itself and installing a distro is left to the one-time
-  `wsl --install` command, because that step needs Administrator rights and a
-  reboot that an application cannot perform silently. The Setup screen shows the
-  exact command when WSL2 is absent.
+- Installing WSL2 itself is now driven by the app. When the WSL2 feature is not
+  installed, the Enable DVD/Blu-ray button runs the Windows installer for it
+  through a single elevation prompt; the user approves that prompt and reboots
+  once, and the app finishes the rest on the next click. The only steps that
+  cannot be automated are that one approval and the reboot, which Windows
+  requires for any feature install.
+
+### Fixed (Windows setup, during 1.9.0 stabilization)
+- WSL2 detection no longer trusts the mere presence of wsl.exe, which exists as
+  a built-in stub on every Windows 11 machine even when the feature is not
+  installed. Detection now reads what wsl actually reports and treats a
+  "not installed" response as feature-absent, so a clean machine correctly runs
+  the installer instead of trying to add a distribution to a feature that is not
+  there.
+- Detection probes no longer hang. On a machine without WSL2, `wsl -l -v` prints
+  a prompt and waits up to 60 seconds for a keypress; the app now closes stdin
+  on these calls so the prompt cannot block startup or setup.
+- The Enable DVD/Blu-ray flow no longer reports success when a step actually
+  failed. The tsMuxeR install is verified with a real presence check and its
+  true result is honored, and a failed distro install that is caused by the WSL2
+  feature being absent now triggers the feature install instead of stopping with
+  a misleading message.
+- The tsMuxeR install script is delivered to WSL2 as base64 that is decoded to a
+  file and run, rather than passed inline. Passing it inline mangled nested
+  quotes, so the install failed inside the app even though the same commands
+  worked when run by hand. The official tsMuxeR Linux release is a .zip and is
+  unzipped rather than assumed to be a tarball.
+- Setup now writes a full log to pyburn_setup.log next to the program, including
+  the raw wsl output and the detection result, so a failed setup can be
+  diagnosed from the file.
 
 ### Notes on Windows coverage
 - Data disc, ISO, audio CD, blank, media info, eject, and ripping run natively
