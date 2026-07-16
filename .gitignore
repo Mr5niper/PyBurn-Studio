@@ -33,3 +33,6 @@ __pycache__/
 # --- OS cruft --------------------------------------------------------------
 .DS_Store
 Thumbs.db
+
+# --- downloaded tools (ffmpeg fetched by Setup) ---
+tools/

@@ -1,5 +1,69 @@
 # PyBurn Studio - Changelog
 
+## [1.9.0] - 2025 - Cross-platform engine architecture (Windows native + WSL2)
+
+PyBurn now runs as a first-class Windows application as well as Linux, instead
+of assuming Unix tools everywhere. It picks the right engine for each job based
+on the platform and what is installed, so a clean Windows machine can burn discs
+with no manual tool hunting.
+
+### Added
+- Per-operation engine routing. A new capability resolver decides, for each job
+  and platform, whether a step runs through the Unix command-line tools, the
+  native Windows burning API (IMAPI2), native Windows CD reading (IOCTL), or a
+  WSL2 Linux environment. Linux behavior is unchanged: everything still runs
+  through the command-line tools.
+- Windows IMAPI2 backend (via comtypes) for data discs, ISO burning, audio CD
+  writing, blanking rewritable media, and eject. No external tools required.
+- Windows IOCTL ripper that reads audio CDs directly through the operating
+  system and encodes with ffmpeg when present, so ripping works on Windows
+  without cdparanoia.
+- WSL2 authoring path for Video DVD and Blu-ray on Windows. The authoring tools
+  that have no Windows build (dvdauthor, tsMuxeR, xorriso) run inside a WSL2
+  distro to generate the disc image, and the native Windows burner writes that
+  image to the drive. This is the split-at-the-file design: Linux userland
+  authors, Windows burns the hardware.
+- First-run Setup screen. On first launch the app shows what each feature can do
+  on this machine, detects WSL2, and can install the Linux toolchain into an
+  existing WSL2 distro with one click. A Setup button re-opens it any time.
+- On-demand tool acquisition on Windows. Setup can download an official ffmpeg
+  build into a local tools\ folder next to the exe (no system install, no admin)
+  to enable audio decode and rip encoding. A single "Enable DVD/Blu-ray (WSL2)"
+  button does the entire authoring setup: it installs a WSL2 Linux distribution
+  if none is present (non-interactively, no username/password prompt), installs
+  the Linux disc tools as root with no password prompt, and fetches tsMuxeR
+  (which is not in apt) so Blu-ray authoring works. If the WSL2 feature itself
+  is not enabled yet, the button starts that one elevated step and asks for a
+  single reboot, then finishes automatically on the next click. WSL2 detection
+  now distinguishes "not installed" from "installed but no distribution yet" so
+  the app gives the right action instead of a dead-end instruction. WSL commands
+  run with the console window suppressed so setup no longer flashes command
+  windows, and the tsMuxeR fetch handles the official Linux release being a .zip
+  (it is unzipped rather than assumed to be a tarball).
+- The tool finder now also searches the local tools\ folder in addition to PATH,
+  so a downloaded ffmpeg is picked up with no restart or manual configuration.
+
+### Changed
+- The About screen now reports readiness per feature (Data disc, Audio CD, Video
+  DVD, Blu-ray, Rip) and the engine each will use, instead of a flat list of
+  every command-line tool marked present or missing. On Windows this reflects
+  the real native and WSL2 paths, so features that work no longer read as
+  errors.
+- Enabling WSL itself and installing a distro is left to the one-time
+  `wsl --install` command, because that step needs Administrator rights and a
+  reboot that an application cannot perform silently. The Setup screen shows the
+  exact command when WSL2 is absent.
+
+### Notes on Windows coverage
+- Data disc, ISO, audio CD, blank, media info, eject, and ripping run natively
+  on Windows with no external tools (installing ffmpeg improves audio decode and
+  rip encoding).
+- Video DVD and Blu-ray authoring on Windows require WSL2 with the Linux tools
+  installed; without WSL2 those two features report as unavailable rather than
+  pretending to work.
+
+---
+
 ## [1.8.0] - 2025 - Reliability fixes and reproducible onefile build
 
 This release works through a full code review and adds a reproducible

@@ -19,6 +19,7 @@ DEFAULT_CONFIG = {
     "history_file": str(Path.home() / ".pyburn_history.json"),
     "logs_dir": str(Path.home() / ".pyburn_logs"),
     "musicbrainz_enabled": True,
+    "setup_completed": False,
 }
 
 

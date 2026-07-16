@@ -7,6 +7,7 @@ from pyburn.core.tools import ToolFinder
 from pyburn.gui.main_window import MainWindow
 from pyburn.style import APP_STYLESHEET
 from pyburn.resources import app_icon, set_windows_app_id
+from pyburn.services.installer import tools_dir
 
 
 def run_gui():
@@ -24,6 +25,12 @@ def run_gui():
         app.setWindowIcon(icon)
     cfg = Config()
     tools = ToolFinder()
+    # Search the local tools\ folder (where ffmpeg is downloaded) in addition
+    # to PATH, so a downloaded ffmpeg is picked up without a system install.
+    try:
+        tools.add_search_dir(str(tools_dir()))
+    except Exception:
+        pass
     if not cfg.settings.get("simulate_when_missing_tools", True):
         missing = tools.missing(["ffmpeg", "mkisofs"])
         if missing:
@@ -32,6 +39,7 @@ def run_gui():
                                 "\nInstall them or enable simulation in Settings.")
     win = MainWindow(cfg, tools)
     win.show()
+    win.maybe_first_run_setup()
     sys.exit(app.exec())
 
 
