@@ -60,8 +60,16 @@ def _no_window_kwargs() -> dict:
 
 def _run(cmd: List[str], timeout: float = 8.0) -> tuple[int, str, str]:
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **_no_window_kwargs())
+        # stdin=DEVNULL is critical: on a machine without WSL installed,
+        # `wsl -l -v` prints "not installed" and then INTERACTIVELY prompts
+        # "Press any key to install..." waiting up to 60s. With stdin closed the
+        # prompt cannot block us; the command returns immediately so detection
+        # does not hang.
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL, **_no_window_kwargs())
         return p.returncode, (p.stdout or ""), (p.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out"
     except Exception as e:
         return 1, "", str(e)
 
@@ -100,67 +108,106 @@ class WSLManager:
 
     def __init__(self):
         self.info = WSLInfo()
+        # Set True by install_distro when WSL reports the Subsystem feature is
+        # not installed, so the caller knows to run the elevated feature install.
+        self._feature_absent = False
 
-    def detect(self) -> WSLInfo:
+    def detect(self, on_log=None) -> WSLInfo:
+        log = on_log or (lambda s: None)
         info = WSLInfo()
         if not is_windows():
             self.info = info
             return info
         if not shutil.which("wsl"):
             # No wsl command at all: WSL platform is not installed.
+            log("detect: wsl.exe not found on PATH")
             self.info = info
             return info
-        # The wsl command exists, so the platform itself is present even if no
-        # distro is installed yet. This is the exact state after `wsl --install`
-        # on machines where the automatic Ubuntu step did not complete.
-        info.platform_present = True
-        # `wsl -l -v` lists distros and their versions. Output is UTF-16 on some
-        # builds; subprocess text mode usually handles it, but we stay tolerant.
+        # wsl.exe exists on every Windows 11 machine as a built-in stub, even
+        # when the WSL feature is NOT installed. So we do NOT trust the command
+        # existing. We use POSITIVE detection: the platform is only considered
+        # present if `wsl -l -v` either returns a real distro listing OR
+        # explicitly reports an empty-but-installed state. Anything else (any
+        # error, any "not installed" text, any unrecognized output, a non-zero
+        # exit) is treated as feature-absent, so the button runs the elevated
+        # installer. This avoids guessing at error strings, which is what missed
+        # the clean-machine case before.
         rc, out, err = _run(["wsl", "-l", "-v"])
-        combined = (out or "") + (err or "")
-        low = combined.lower()
-        if "no installed distributions" in low or "has no installed" in low:
-            # Platform present, but zero distros. available stays False; the UI
-            # offers a one-click distro install rather than telling the user to
-            # open PowerShell.
-            self.info = info
-            return info
-        if rc != 0 or not out.strip():
-            # Older WSL without -v, try a plain list.
-            rc2, out2, err2 = _run(["wsl", "-l"])
-            combined2 = ((out2 or "") + (err2 or "")).lower()
-            if "no installed distributions" in combined2 or "has no installed" in combined2:
-                self.info = info
-                return info
-            if rc2 == 0 and out2.strip():
-                names = [ln.strip() for ln in out2.replace("\x00", "").splitlines()[1:] if ln.strip()]
-                info.distros = [n.replace(" (Default)", "").strip() for n in names]
-                if info.distros:
-                    info.default_distro = info.distros[0]
-                    info.available = True
-            self.info = info
-            return info
-        text = out.replace("\x00", "")
-        for ln in text.splitlines()[1:]:
+        # WSL output is UTF-16 on many builds; strip nulls before matching.
+        out_clean = (out or "").replace("\x00", "")
+        err_clean = (err or "").replace("\x00", "")
+        low = (out_clean + err_clean).lower()
+        log(f"detect: `wsl -l -v` rc={rc}")
+        for _ln in (out_clean + err_clean).splitlines():
+            if _ln.strip():
+                log(f"detect: | {_ln.strip()}")
+
+        # Parse any real distro rows from `wsl -l -v`.
+        distros: List[str] = []
+        default_distro = None
+        version2 = False
+        for ln in out_clean.splitlines():
             s = ln.strip()
             if not s:
+                continue
+            # Skip the header row.
+            if s.lower().startswith("name") or ("state" in s.lower() and "version" in s.lower()):
                 continue
             default = s.startswith("*")
             s2 = s.lstrip("*").strip()
             parts = s2.split()
-            if not parts:
+            if len(parts) < 2:
+                continue
+            # A real row looks like: NAME  STATE  VERSION  (version is 1 or 2)
+            ver = parts[-1]
+            if ver not in ("1", "2"):
                 continue
             name = parts[0]
-            ver = parts[-1]
-            info.distros.append(name)
+            distros.append(name)
             if default:
-                info.default_distro = name
+                default_distro = name
             if ver == "2":
-                info.version2 = True
-        if not info.default_distro and info.distros:
-            info.default_distro = info.distros[0]
-        # available is True only if we actually found at least one distro.
-        info.available = bool(info.distros)
+                version2 = True
+
+        if distros:
+            # Real distros exist: feature present AND usable.
+            info.platform_present = True
+            info.distros = distros
+            info.default_distro = default_distro or distros[0]
+            info.version2 = version2
+            info.available = True
+            log(f"detect: distros found {distros}; available=True")
+            self.info = info
+            return info
+
+        # No distro rows parsed. Decide between two very different states:
+        #   (a) feature PRESENT but empty  -> install a distro
+        #   (b) feature ABSENT             -> install the WSL feature
+        # The message "has no installed distributions" is only ever produced
+        # when the WSL feature IS installed, so it is the decisive signal for
+        # (a). It also contains guidance text mentioning "wsl.exe --install",
+        # so we must NOT let a generic "--install" match flip us to (b). The
+        # empty-but-installed signal wins.
+        empty_but_installed = (
+            "no installed distributions" in low
+            or "has no installed" in low
+        )
+        if empty_but_installed:
+            info.platform_present = True   # present, zero distros
+            log("detect: feature present, zero distros -> platform_present=True, available=False")
+            self.info = info
+            return info
+
+        # Otherwise look for explicit feature-absent wording. "is not installed"
+        # is the reliable phrase wsl prints when the feature itself is missing.
+        says_absent = (
+            "is not installed" in low
+            or "optional component is not enabled" in low
+            or "please enable the virtual machine platform" in low
+        )
+        info.platform_present = not says_absent
+        log(f"detect: no distros, empty_but_installed=False, says_absent={says_absent} "
+            f"-> platform_present={info.platform_present}")
         self.info = info
         return info
 
@@ -190,9 +237,33 @@ class WSLManager:
             for ln in msg.replace("\x00", "").splitlines():
                 if ln.strip():
                     log(ln.strip())
+        low = msg.lower()
+
+        # If WSL says the Subsystem itself is not installed, the distro step
+        # cannot work: the WSL2 Windows feature has to be installed first. Match
+        # only the reliable "is not installed" / feature-component phrases, NOT a
+        # generic "--install" mention (that also appears in the harmless
+        # "add a distribution" guidance and would cause a false feature-install
+        # loop).
+        subsystem_absent = (
+            "is not installed" in low
+            or "optional component is not enabled" in low
+            or "please enable the virtual machine platform" in low
+        )
+        if subsystem_absent:
+            log("WSL2 feature is not installed on this machine; it must be installed first.")
+            self._feature_absent = True
+            return False
+
         # Some Windows builds ignore --no-launch; retry without it if needed.
-        if rc != 0 and "no-launch" in msg.lower():
+        if rc != 0 and "no-launch" in low:
             rc, out2, err2 = _run(["wsl", "--install", "-d", distro], timeout=timeout)
+            low2 = ((out2 or "") + (err2 or "")).lower()
+            if ("is not installed" in low2
+                    or "optional component is not enabled" in low2):
+                log("WSL2 feature is not installed on this machine; it must be installed first.")
+                self._feature_absent = True
+                return False
         # Give WSL a moment, then re-detect.
         import time as _t
         _t.sleep(3)
@@ -210,8 +281,7 @@ class WSLManager:
                 if ln.strip():
                     log("  " + ln.strip())
         else:
-            log("Distro install did not complete, and no online distro list was available "
-                "(corporate policy may block Store/distro downloads).")
+            log("Distro install did not complete, and no online distro list was available.")
         return False
 
     def win_to_wsl_path(self, win_path: str) -> str:

@@ -31,12 +31,12 @@ def run_gui():
         tools.add_search_dir(str(tools_dir()))
     except Exception:
         pass
-    if not cfg.settings.get("simulate_when_missing_tools", True):
-        missing = tools.missing(["ffmpeg", "mkisofs"])
-        if missing:
-            QMessageBox.warning(None, "Missing Tools",
-                                "Missing required tools: " + ", ".join(missing) +
-                                "\nInstall them or enable simulation in Settings.")
+    # NOTE: no global startup tool check. Which tools are needed depends on the
+    # platform and the job (on Windows most jobs use native engines and need no
+    # external tools at all). The Setup and About screens report real per-feature
+    # readiness; a blanket PATH check for mkisofs/ffmpeg at launch was obsolete
+    # and fired a false "missing tools" popup on Windows where those are not
+    # required.
     win = MainWindow(cfg, tools)
     win.show()
     win.maybe_first_run_setup()
