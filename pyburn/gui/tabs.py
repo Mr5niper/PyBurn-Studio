@@ -102,7 +102,7 @@ class DataBurnTab(BaseTab):
         lay.addWidget(opts)
         self.gauge = CapacityGauge(DVD_BYTES)
         lay.addWidget(self.gauge)
-        self.btn = QPushButton("Queue Job: Burn Data Disc")
+        self.btn = QPushButton("Burn Data Disc")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -201,7 +201,7 @@ class DataBurnTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
 
 
 class AudioCDTab(BaseTab):
@@ -244,7 +244,7 @@ class AudioCDTab(BaseTab):
         self.chk_eject = QCheckBox("Eject after burn")
         self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
         lay.addWidget(self.chk_eject)
-        self.btn = QPushButton("Queue Job: Create Audio CD")
+        self.btn = QPushButton("Burn Audio CD")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -386,7 +386,7 @@ class AudioCDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
 
 
 class VideoDVDTab(BaseTab):
@@ -417,7 +417,7 @@ class VideoDVDTab(BaseTab):
         self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
         lay.addWidget(self.chk_blank)
         lay.addWidget(self.chk_eject)
-        self.btn = QPushButton("Queue Job: Create Video DVD")
+        self.btn = QPushButton("Burn Video DVD")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -482,7 +482,7 @@ class VideoDVDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
 
 
 class VideoBDTab(BaseTab):
@@ -513,7 +513,7 @@ class VideoBDTab(BaseTab):
         self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
         lay.addWidget(self.chk_blank)
         lay.addWidget(self.chk_eject)
-        self.btn = QPushButton("Queue Job: Create Blu-ray")
+        self.btn = QPushButton("Burn Blu-ray")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -577,7 +577,7 @@ class VideoBDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
 
 
 class RipCDTab(BaseTab):
@@ -612,7 +612,7 @@ class RipCDTab(BaseTab):
         self.btn_mb = QPushButton("Lookup Metadata (MusicBrainz)")
         self.btn_mb.clicked.connect(self._lookup_mb)
         lay.addWidget(self.btn_mb)
-        self.btn = QPushButton("Queue Job: Rip CD")
+        self.btn = QPushButton("Start Ripping CD")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -696,4 +696,4 @@ class RipCDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
