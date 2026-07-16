@@ -284,11 +284,20 @@ class AudioCDTab(BaseTab):
         # duration with ffprobe in a background thread so dropping in a full
         # album does not freeze the UI. Fall back to a rough estimate if ffprobe
         # is unavailable.
+        #
+        # IMPORTANT: adding files fires this repeatedly. Each run starts a
+        # QThread, and we MUST keep a reference to every running thread until it
+        # finishes; otherwise Python garbage-collects a still-running QThread and
+        # the app crashes hard with no error. We keep a set of live threads and
+        # drop each one only when it has finished.
         ffprobe = self.tools.find("ffprobe")
         file_list = list(files)
         if not file_list:
             self.gauge.update_duration(0.0)
             return
+
+        if not hasattr(self, "_dur_threads"):
+            self._dur_threads = set()
 
         class DurThread(QThread):
             done = pyqtSignal(float)
@@ -299,24 +308,31 @@ class AudioCDTab(BaseTab):
                 self.probe = probe
 
             def run(self):
-                secs = compute_total_duration(self.paths, self.probe)
+                try:
+                    secs = compute_total_duration(self.paths, self.probe)
+                except Exception:
+                    secs = 0.0
                 self.done.emit(secs)
 
         snapshot = file_list
+        thread = DurThread(file_list, ffprobe)
 
-        def on_done(secs):
-            if secs and secs > 0:
-                self.gauge.update_duration(secs)
-            else:
-                # No ffprobe or probing failed: estimate from typical CD audio
-                # rate (about 10 MB per minute) so the gauge is at least in the
-                # right ballpark rather than reading far too low off MP3 bytes.
-                est_seconds = compute_total_size(snapshot) / (10 * 1024 * 1024) * 60.0
-                self.gauge.update_duration(est_seconds)
+        def on_done(secs, th=thread):
+            try:
+                if secs and secs > 0:
+                    self.gauge.update_duration(secs)
+                else:
+                    est_seconds = compute_total_size(snapshot) / (10 * 1024 * 1024) * 60.0
+                    self.gauge.update_duration(est_seconds)
+            finally:
+                # Now that it has finished, stop tracking it. Do this after the
+                # thread has fully finished to avoid destroying a running thread.
+                self._dur_threads.discard(th)
 
-        self._dur_thread = DurThread(file_list, ffprobe)
-        self._dur_thread.done.connect(on_done)
-        self._dur_thread.start()
+        thread.done.connect(on_done)
+        thread.finished.connect(lambda th=thread: self._dur_threads.discard(th))
+        self._dur_threads.add(thread)
+        thread.start()
 
     def _add(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Select Audio Files", "", "Audio (*.mp3 *.wav *.flac *.ogg *.m4a *.aac)")
