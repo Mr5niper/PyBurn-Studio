@@ -4,10 +4,13 @@ import subprocess
 from typing import Optional, Dict, Any, List
 from .exec import ProcessRunner
 from ..core.tools import ToolFinder
+
+
 class MediaTools:
     def __init__(self, tools: ToolFinder, runner: ProcessRunner):
         self.tools = tools
         self.runner = runner
+
     def get_info(self, device: str) -> Dict[str, Optional[Any]]:
         info: Dict[str, Optional[Any]] = {"type": "unknown", "rewritable": None, "blank": None, "speeds": None}
         mediainfo = self.tools.find("dvd+rw-mediainfo")
@@ -15,9 +18,12 @@ class MediaTools:
             try:
                 p = subprocess.run([mediainfo, device], capture_output=True, text=True, timeout=8)
                 out = (p.stdout or "")
-                if "BD" in out: info["type"] = "BD"
-                elif "DVD" in out: info["type"] = "DVD"
-                elif "CD" in out: info["type"] = "CD"
+                if "BD" in out:
+                    info["type"] = "BD"
+                elif "DVD" in out:
+                    info["type"] = "DVD"
+                elif "CD" in out:
+                    info["type"] = "CD"
                 m = re.search(r"Disc status:\s*(\w+)", out)
                 if m:
                     info["blank"] = (m.group(1).strip().lower() == "blank")
@@ -39,6 +45,7 @@ class MediaTools:
             except Exception:
                 pass
         return info
+
     def resolve_speed(self, requested_speed: Any, device: str) -> int:
         # Accept "Auto" or numeric string/int
         if isinstance(requested_speed, str):
@@ -52,12 +59,20 @@ class MediaTools:
         info = self.get_info(device)
         speeds = info.get("speeds")
         if speeds and isinstance(speeds, list) and len(speeds) > 0:
-            idx = max(0, (len(speeds) // 2) - 1)
+            # Pick the true middle of the sorted speed list. Integer division
+            # gives the middle element for odd counts and the upper-middle for
+            # even counts, e.g. [4,8] -> 8, [4,8,16] -> 8. The old
+            # "(len // 2) - 1" picked the slowest on a two-speed drive.
+            idx = len(speeds) // 2
             return speeds[idx]
-        if info.get("type") == "CD": return 16
-        if info.get("type") == "DVD": return 8
-        if info.get("type") == "BD": return 4
+        if info.get("type") == "CD":
+            return 16
+        if info.get("type") == "DVD":
+            return 8
+        if info.get("type") == "BD":
+            return 4
         return 8
+
     def blank_media(self, device: str) -> bool:
         fmt = self.tools.find("dvd+rw-format")
         if fmt and device.startswith("/"):
@@ -74,6 +89,7 @@ class MediaTools:
             except Exception:
                 pass
         return False
+
     def eject(self, device: str) -> None:
         ej = self.tools.find("eject")
         if ej and device.startswith("/"):

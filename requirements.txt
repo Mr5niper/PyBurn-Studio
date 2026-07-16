@@ -1,2 +1,14 @@
-PyQt6>=6.4.0
-requests>=2.28.0
+requests==2.32.3
+
+PyQt6==6.9.1
+PyQt6-Qt6==6.9.1
+PyQt6-sip==13.10.2
+
+pyinstaller==6.16.0
+pyinstaller-hooks-contrib==2025.9
+altgraph==0.17.4
+packaging==25.0
+pefile==2023.2.7
+pywin32-ctypes==0.2.3
+setuptools==80.9.0
+wheel==0.45.1

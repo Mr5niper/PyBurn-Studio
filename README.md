@@ -1,247 +1,145 @@
 # PyBurn Studio
 
-A professional disc burning application for creating CDs, DVDs, and Blu-ray discs on Linux, macOS, and Windows.
+PyBurn Studio is a desktop disc authoring application built with Python and
+PyQt6. It is a graphical front end for the standard command-line disc tools
+(mkisofs/genisoimage, cdrecord/wodim, growisofs, cdrdao, ffmpeg, dvdauthor,
+cdparanoia, and friends). It does not reinvent burning; it drives those tools
+for you and shows real progress, a job queue, verification, and history.
 
-## What Does It Do?
+Version 1.8.0.
 
-PyBurn Studio lets you:
+## What it does
 
-- **Burn data discs** - Back up your files to CD, DVD, or Blu-ray
-- **Create audio CDs** - Make music CDs that play in any CD player
-- **Author video DVDs** - Create DVD-Video discs with menus
-- **Make Blu-ray discs** - Author BDMV format Blu-ray discs
-- **Rip audio CDs** - Extract music to MP3, FLAC, or WAV files
+- Burn data discs (CD, DVD, Blu-ray) from files and folders, with an ISO built
+  by mkisofs and written by growisofs or cdrecord.
+- Author audio CDs from MP3/WAV/FLAC/OGG/M4A/AAC with optional CD-Text
+  (album and per-track title and performer).
+- Author video DVDs (transcode with ffmpeg, structure with dvdauthor) and
+  Blu-ray BDMV discs (requires tsMuxeR).
+- Rip audio CDs to MP3, FLAC, or WAV with cdparanoia, with optional MusicBrainz
+  metadata lookup.
+- Queue multiple jobs and run them one at a time so the drive is never double
+  booked, with a live progress bar, a global job log, and a persistent history
+  you can retry from.
+- Verify burns two ways: read the disc back and compare size plus a SHA-256
+  checksum for small images, or fall back to an isoinfo listing compare.
 
-Everything runs through an easy-to-use graphical interface with drag-and-drop support, progress tracking, and automatic verification to ensure your burns are successful.
+If a required tool is missing, the app can run the job in simulation mode so you
+can still exercise the interface. This is controlled in Settings.
 
-## Getting Started
+## Requirements
 
-### System Requirements
+Runtime Python dependency:
 
-- **Python 3.9 or newer**
-- **At least 2GB of RAM** (4GB recommended for video work)
-- **An optical drive** (CD/DVD/Blu-ray burner)
-- **Free disk space** - About twice the size of what you're burning
+- PyQt6 (pinned to 6.9.1 for the packaged build)
 
-### Installation
+Optional Python dependency:
 
-**Step 1: Install Python packages**
+- requests (enables MusicBrainz lookups; the feature is disabled cleanly if it
+  is not installed)
+
+External command-line tools (install the ones you need for the disc types you
+plan to author):
+
+- ISO creation: mkisofs or genisoimage, xorriso
+- Burning: cdrecord or wodim, growisofs, cdrdao
+- Media control: dvd+rw-mediainfo, dvd+rw-format, eject
+- Verification: isoinfo, readom or readcd
+- Audio and video: ffmpeg, ffprobe, cdparanoia, lame, flac
+- DVD authoring: dvdauthor
+- Blu-ray authoring: tsMuxeR (optional; the Blu-ray path needs it)
+- Metadata: cd-discid (optional; needed for MusicBrainz)
+
+### Installing the external tools
+
+Debian/Ubuntu:
 
 ```bash
-pip install PyQt6 requests
+sudo apt install genisoimage wodim dvd+rw-tools cdrdao ffmpeg \
+  cdparanoia lame flac dvdauthor xorriso eject cd-discid
 ```
 
-**Step 2: Install system tools**
+macOS (Homebrew):
 
-On **Ubuntu/Debian**:
-```bash
-sudo apt install genisoimage wodim growisofs cdrdao ffmpeg \
-  cdparanoia lame flac dvdauthor isoinfo dvd+rw-tools \
-  eject cd-discid xorriso
-```
-
-On **macOS** (using Homebrew):
 ```bash
 brew install cdrtools dvd+rw-tools ffmpeg cdrdao cdparanoia \
   lame flac dvdauthor xorriso
 ```
 
-On **Windows**:
-We recommend using WSL2 (Windows Subsystem for Linux) and following the Ubuntu instructions above.
+Windows: the tools above are Unix programs. The supported way to provide them on
+Windows is WSL2 (Windows Subsystem for Linux). Install the tools inside your WSL
+distribution. Without the tools present, the Windows build runs in simulation
+mode so the interface still works, but it will not write a real disc. See the
+Platform notes section below.
 
-**Step 3: Run the application**
+## Running from source
 
 ```bash
+python -m venv .venv
+# Linux/macOS:
+source .venv/bin/activate
+# Windows:
+.venv\Scripts\activate
+
+pip install PyQt6 requests
 python pyburn_studio.py
 ```
 
-That's it! The application will open and you can start burning discs.
+Run the built-in self-test (no hardware or tools required):
 
-## How to Use
+```bash
+python pyburn_studio.py --self-test
+```
 
-### Burning a Data Disc
+The self-test enqueues five simulated jobs (data, audio, rip, video DVD,
+Blu-ray) and confirms the queue runs them all to completion in order.
 
-1. Click the **Data Disc** tab
-2. Drag and drop your files and folders into the window
-3. Choose your disc type (CD, DVD, or Blu-ray)
-4. Set a volume label if you want
-5. Click **Queue Job** to start burning
+## Building a single-file executable
 
-The application will create an ISO image of your files, burn it to the disc, and verify that everything copied correctly.
+The repository ships a reproducible build. Requirements are fully pinned in
+`requirements.txt`, the build creates its own virtual environment, and the
+PyInstaller recipe is the checked-in `pyburn_studio.spec`.
 
-### Creating an Audio CD
+On Windows, double-click `BUILD_EXE.bat`. It verifies Python 3.13.12 through the
+`py -3.13` launcher, creates `.\venv`, installs the pinned requirements, and
+produces `dist\PyBurnStudio.exe` as one file. Full instructions, including the
+manual PowerShell steps, are in `Docs/BUILD_EXE.md`.
 
-1. Click the **Audio CD** tab
-2. Add your music files (MP3, FLAC, WAV, etc.)
-3. Use **Move Up/Down** to arrange the track order
-4. Optionally add album and track information
-5. Click **Queue Job** to create your CD
+## How to use it
 
-The CD will play in any standard CD player or car stereo.
+1. Open the tab for the kind of disc you want (Data, Audio, Video DVD, Blu-ray,
+   or Rip CD).
+2. Add files or folders. For data and media discs the capacity gauge shows how
+   full the disc will be.
+3. Set options (volume label, verify, auto-blank rewritable media, eject after
+   burn, and so on). Global defaults live in Settings.
+4. Click the Queue Job button. The job goes into the queue at the bottom and
+   starts when the drive is free.
+5. Watch progress in the Queue tab, open the job log for detail, and find
+   finished jobs in the History tab, where you can show the log, export it, or
+   retry the job.
 
-### Making a Video DVD
+## Configuration and data locations
 
-1. Click the **Video DVD** tab
-2. Add your video files (MP4, AVI, MKV, etc.)
-3. The app will transcode them to DVD format
-4. Click **Queue Job** to create your DVD
+- Settings: `~/.pyburn_config.json`
+- History: `~/.pyburn_history.json`
+- Per-job logs: `~/.pyburn_logs/`
+- Temporary build files: the temp directory set in Settings
+  (default `~/PyBurn_Temp`)
 
-The resulting DVD will play in standard DVD players.
+## Platform notes
 
-### Ripping an Audio CD
-
-1. Insert your audio CD
-2. Click the **Rip CD** tab
-3. Choose your output format (MP3, FLAC, or WAV)
-4. Optionally click **Lookup Metadata** to get track names
-5. Click **Queue Job** to extract the music
-
-Your ripped tracks will be saved to your Music folder.
-
-## Features Explained
-
-### Job Queue
-
-You can add multiple burn jobs and they'll process one at a time. This is useful if you want to burn several discs in a row without babysitting the computer.
-
-- View all pending jobs in the **Queue** tab
-- Cancel the current job if needed
-- Remove jobs from the queue before they start
-
-### History and Logs
-
-Every job is logged so you can see what happened:
-
-- The **History** tab shows all completed jobs
-- Click **Show Log** to view detailed output
-- Click **Retry** to run a previous job again
-- Click **Export Log** to save the log file
-
-### Verification
-
-After burning a disc, PyBurn can verify that your data was written correctly:
-
-- **Readback verification** - Reads the disc back and compares checksums
-- **Listing verification** - Compares the file list on the disc to your original files
-
-Enable verification in Settings for important burns.
-
-### Smart Features
-
-- **Auto device detection** - Finds your burner automatically
-- **Speed selection** - Picks a safe burn speed based on your media
-- **RW media handling** - Automatically offers to erase rewritable discs
-- **Temp space checking** - Warns you if you don't have enough disk space
-- **Capacity gauge** - Shows how much space your files will use
-
-## Keyboard Shortcuts
-
-- **Ctrl+Q** - Quit the application
-- **Ctrl+L** - Open the job log window
-- **F1** - Show the About dialog
-
-## Settings
-
-Click the **Settings** button to configure:
-
-- **Disc Device** - Which burner to use
-- **Burn Speed** - How fast to write (Auto is recommended)
-- **Temp Directory** - Where to store temporary files
-- **Verify After Burn** - Check disc integrity after writing
-- **Auto-blank RW Media** - Automatically erase rewritable discs
-- **Eject After Burn** - Pop the disc out when done
-- **Simulate When Tools Missing** - Test the app without burning
-
-## Troubleshooting
-
-### The app says "missing tools"
-
-You need to install the system tools listed in the installation section above. If you just want to test the app, enable "Simulate when tools are missing" in Settings.
-
-### My device isn't detected
-
-- Make sure your optical drive is connected and powered on
-- Click **Scan** in the Settings dialog
-- On Linux, make sure you're in the `cdrom` group: `sudo usermod -a -G cdrom $USER`
-
-### Burns are failing
-
-- Try a slower burn speed (select a specific speed instead of "Auto")
-- Use quality blank media from reputable brands
-- Clean your drive's lens with a cleaning disc
-- Check that your drive firmware is up to date
-
-### The app is slow
-
-- Video transcoding is CPU-intensive and can take time
-- Use an SSD for your temp directory if possible
-- Close other programs while burning
-- For large video files, be patient - transcoding takes time
-
-### Verification failed
-
-- The disc might be damaged or low quality
-- Try burning at a slower speed
-- Try different blank media
-- Your drive may need cleaning
-
-## What Media Can I Use?
-
-- **CD-R** - Write once, 700MB
-- **CD-RW** - Rewritable, 700MB
-- **DVD-R / DVD+R** - Write once, 4.7GB
-- **DVD-RW / DVD+RW** - Rewritable, 4.7GB
-- **BD-R** - Blu-ray write once, 25GB
-- **BD-RE** - Blu-ray rewritable, 25GB
-
-## Getting Help
-
-- **Logs** - Check `~/.pyburn_logs/` for detailed operation logs
-- **Settings file** - Your preferences are in `~/.pyburn_config.json`
-- **History file** - Past jobs are recorded in `~/.pyburn_history.json`
-
-## Known Limitations
-
-**Windows Support**  
-Windows requires WSL2 or Cygwin to provide Unix-like tools. Native Windows support is limited.
-
-**Blu-ray Authoring**  
-Creating Blu-ray discs requires tsMuxeR, which isn't available in most package managers. Download it from the official tsMuxeR website.
-
-**MusicBrainz Lookup**  
-Automatic CD metadata lookup requires the `cd-discid` tool and Python `requests` library, plus internet access.
-
-## Technical Details
-
-PyBurn Studio is built with:
-
-- **Python 3.9+** for application logic
-- **PyQt6** for the graphical interface
-- **Industry-standard tools** for disc operations (mkisofs, cdrecord, growisofs, ffmpeg, etc.)
-
-The application uses a modular architecture with separate layers for the user interface, business logic, and disc operations. Jobs run in background threads so the UI stays responsive.
-
-All operations are logged, and you can run the app in simulation mode to test it without burning actual discs.
+- Linux is the primary platform. Optical drives appear as `/dev/sr0` and the
+  like. You may need your user in the `cdrom` group to access the drive.
+- macOS works with the tools installed through Homebrew. Device paths differ
+  (for example `/dev/disk2`).
+- Windows has no native equivalents for these Unix tools. Use WSL2 to provide
+  them. The Windows build detects optical drives with a PowerShell CIM query
+  (`Win32_CDROMDrive`) and falls back to the older WMIC only if that fails,
+  because WMIC was removed from Windows 11 24H2. Without the burning tools the
+  Windows build stays in simulation mode.
 
 ## License
 
-GPL-3.0 License
-
-Copyright (c) 2025 [Your Name]
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program. If not, see <https://www.gnu.org/licenses/>.
-
-## Credits
-
-Created with Python and PyQt6. Built on top of excellent open source disc authoring tools maintained by the Linux and BSD communities.
+PyBurn Studio is released under the GNU General Public License, version 3. See
+the `LICENSE` file for the full text.

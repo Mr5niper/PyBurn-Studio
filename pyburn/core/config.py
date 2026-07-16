@@ -1,7 +1,10 @@
 from __future__ import annotations
 import json
+import re
+import platform
 from pathlib import Path
 from typing import Any, Dict
+
 DEFAULT_CONFIG = {
     "burn_speed": "Auto",
     "verify_after_burn": True,
@@ -17,11 +20,14 @@ DEFAULT_CONFIG = {
     "logs_dir": str(Path.home() / ".pyburn_logs"),
     "musicbrainz_enabled": True,
 }
+
+
 class Config:
     def __init__(self, path: Path | None = None):
         self.path = path or Path.home() / ".pyburn_config.json"
         self.settings: Dict[str, Any] = {}
         self.load()
+
     def load(self):
         self.settings = dict(DEFAULT_CONFIG)
         if self.path.exists():
@@ -32,6 +38,8 @@ class Config:
                     self.settings.update(data)
             except Exception:
                 pass
+
+        # Determine a default device if missing
         if not self.settings.get("default_device"):
             try:
                 from .devices import DeviceScanner
@@ -39,8 +47,22 @@ class Config:
                 self.settings["default_device"] = devs[0].id if devs else "/dev/sr0"
             except Exception:
                 self.settings["default_device"] = "/dev/sr0"
+
+        # Migrate away from deprecated/wrong formats (like SCSI IDs or non-sr* on Linux)
+        try:
+            if platform.system().lower() == "linux":
+                cur = str(self.settings.get("default_device") or "")
+                if not cur.startswith("/dev/sr") or re.match(r"^\d+,\d+,\d+$", cur):
+                    from .devices import DeviceScanner
+                    devs = DeviceScanner().scan_devices()
+                    if devs:
+                        self.settings["default_device"] = devs[0].id
+        except Exception:
+            pass
+
         Path(self.settings["temp_dir"]).mkdir(parents=True, exist_ok=True)
         Path(self.settings["logs_dir"]).mkdir(parents=True, exist_ok=True)
+
     def save(self):
         try:
             Path(self.settings["temp_dir"]).mkdir(parents=True, exist_ok=True)

@@ -1,59 +1,97 @@
 from __future__ import annotations
+import glob
+import os
 import platform
-import re
 import subprocess
-import shutil
 from dataclasses import dataclass
 from typing import List
+
+
 @dataclass
 class DeviceInfo:
     id: str
     display: str
+
+
 class DeviceScanner:
     def scan_devices(self) -> List[DeviceInfo]:
         sysname = platform.system().lower()
+        if sysname == "linux":
+            return self._scan_linux()
+        if sysname == "windows":
+            return self._scan_windows()
+        if sysname == "darwin":
+            return self._scan_macos()
+        return [DeviceInfo("/dev/sr0", "/dev/sr0 (default)")]
+
+    def _scan_linux(self) -> List[DeviceInfo]:
         devs: List[DeviceInfo] = []
-        wodim = shutil.which("wodim")
-        if wodim:
+        # Strict: only /dev/sr* (optical) to avoid HDDs/USB sticks
+        sr_paths = sorted(glob.glob("/dev/sr*"))
+        for path in sr_paths:
+            base = os.path.basename(path)
+            vendor = ""
+            model = ""
+            tran = ""
             try:
-                p = subprocess.run([wodim, "--devices"], capture_output=True, text=True, timeout=6)
-                output = (p.stdout or "") + "\n" + (p.stderr or "")
-                for ln in output.splitlines():
-                    m = re.search(r"(\d+,\d+,\d+)\s+\d+\)\s+'([^']+)'\s+'([^']+)'", ln)
-                    if m:
-                        sid = m.group(1)
-                        display = f"[{sid}] {m.group(2).strip()} {m.group(3).strip()}"
-                        devs.append(DeviceInfo(sid, display))
+                with open(f"/sys/class/block/{base}/device/vendor", "r", encoding="utf-8") as f:
+                    vendor = f.read().strip()
+            except Exception:
+                pass
+            try:
+                with open(f"/sys/class/block/{base}/device/model", "r", encoding="utf-8") as f:
+                    model = f.read().strip()
+            except Exception:
+                pass
+            try:
+                p = subprocess.run(["lsblk", "-no", "TRAN", path], capture_output=True, text=True, timeout=2)
+                tran = (p.stdout or "").strip().upper()
+            except Exception:
+                pass
+            tag = f"[{tran}] " if tran else ""
+            display = f"{path} {tag}{vendor} {model}".strip()
+            devs.append(DeviceInfo(path, display))
+        try:
+            if os.path.islink("/dev/cdrom"):
+                real = os.path.realpath("/dev/cdrom")
+                if real in sr_paths:
+                    devs = [DeviceInfo(real, f"{real} (cdrom)")] + [d for d in devs if d.id != real]
+        except Exception:
+            pass
+        if not devs:
+            devs.append(DeviceInfo("/dev/sr0", "/dev/sr0 (default)"))
+        return devs
+
+    def _scan_windows(self) -> List[DeviceInfo]:
+        devs: List[DeviceInfo] = []
+        # Prefer PowerShell CIM (the supported, non-deprecated path on modern
+        # Windows). WMIC was removed from Windows 11 24H2, so it is only a
+        # legacy fallback now.
+        try:
+            cmd = [
+                "powershell", "-NoProfile", "-Command",
+                "Get-CimInstance Win32_CDROMDrive | Select-Object -ExpandProperty Drive"
+            ]
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+            for ln in (p.stdout or "").splitlines():
+                drv = ln.strip()
+                if drv and len(drv) >= 2 and drv[1] == ":":
+                    devs.append(DeviceInfo(drv, f"{drv} (optical)"))
+        except Exception:
+            pass
+        if not devs:
+            try:
+                p = subprocess.run(["wmic", "cdrom", "get", "drive"], capture_output=True, text=True, timeout=5)
+                lines = (p.stdout or "").splitlines()
+                for ln in lines[1:]:
+                    drv = ln.strip()
+                    if drv and len(drv) >= 2 and drv[1] == ":":
+                        devs.append(DeviceInfo(drv, f"{drv} (optical)"))
             except Exception:
                 pass
         if not devs:
-            cdrecord = shutil.which("cdrecord")
-            if cdrecord:
-                try:
-                    p = subprocess.run([cdrecord, "-scanbus"], capture_output=True, text=True, timeout=6)
-                    output = (p.stdout or "") + "\n" + (p.stderr or "")
-                    for ln in output.splitlines():
-                        m = re.search(r"(\d+,\d+,\d+)\)\s+'([^']+)'\s+'([^']+)'", ln)
-                        if m:
-                            sid = m.group(1)
-                            display = f"[{sid}] {m.group(2).strip()} {m.group(3).strip()}"
-                            devs.append(DeviceInfo(sid, display))
-                except Exception:
-                    pass
-        if not devs and sysname == "linux":
-            try:
-                p = subprocess.run(["lsblk", "-S", "-o", "NAME,TRAN,TYPE,MODEL"], capture_output=True, text=True, timeout=4)
-                for ln in (p.stdout or "").splitlines():
-                    if "rom" in ln or "cd" in ln.lower():
-                        name = ln.split()[0]
-                        dp = f"/dev/{name}"
-                        devs.append(DeviceInfo(dp, f"{dp} (optical)"))
-            except Exception:
-                pass
-            if not devs:
-                devs.append(DeviceInfo("/dev/sr0", "/dev/sr0 (default)"))
-        if not devs and sysname == "darwin":
-            devs.append(DeviceInfo("/dev/disk2", "/dev/disk2 (default)"))
-        if not devs and sysname == "windows":
             devs.append(DeviceInfo("0,0,0", "0,0,0 (default)"))
         return devs
+
+    def _scan_macos(self) -> List[DeviceInfo]:
+        return [DeviceInfo("/dev/disk2", "/dev/disk2 (default)")]
