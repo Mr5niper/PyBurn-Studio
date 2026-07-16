@@ -257,31 +257,45 @@ class IMAPI2Backend:
     def burn_audio(self, wav_files: List[Path], device: str,
                    on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
                    eject_after: bool = True) -> None:
-        """Burn Red Book audio tracks from 44100/16-bit stereo WAV files."""
+        """Burn Red Book audio tracks from 44100/16-bit stereo WAV files.
+
+        Uses the TrackAtOnce interface. PrepareMedia() is called EXACTLY ONCE
+        before adding any tracks, then every track is added, then ReleaseMedia()
+        once at the end. (An earlier version called PrepareMedia() inside the
+        per-track loop, which throws a COM error after the first track and
+        aborted the burn.)
+        """
         recorder = self._recorder_for(device)
-        audio = self._new("IMAPI2.MsftDiscFormat2RawCD")
-        # RawCD is the reliable audio path; some systems expose MsftDiscFormat2TrackAtOnce.
         try:
             tao = self._new("IMAPI2.MsftDiscFormat2TrackAtOnce")
+        except Exception as e:
+            raise RuntimeError(f"IMAPI2 TrackAtOnce interface unavailable: {e}")
+        if tao is None:
+            raise RuntimeError("IMAPI2 TrackAtOnce audio interface unavailable on this system")
+
+        tao.Recorder = recorder
+        tao.ClientName = "PyBurn Studio"
+        try:
+            self._wire_progress(tao, on_progress, audio=True)
         except Exception:
-            tao = None
-        on_status("Burning audio CD (IMAPI2)...")
-        if tao is not None:
-            tao.Recorder = recorder
-            tao.ClientName = "PyBurn Studio"
-            try:
-                self._wire_progress(tao, on_progress, audio=True)
-            except Exception:
-                pass
-            n = max(1, len(wav_files))
+            pass
+
+        n = max(1, len(wav_files))
+        on_status("Preparing disc for audio burn (IMAPI2)...")
+        tao.PrepareMedia()
+        try:
             for i, wav in enumerate(wav_files, start=1):
+                on_status(f"Writing audio track {i}/{n} (IMAPI2)...")
                 istream = self._audio_istream_for_wav(wav)
-                tao.PrepareMedia()
                 tao.AddAudioTrack(istream)
                 on_progress(int((i / n) * 100))
-            tao.ReleaseMedia()
-        else:
-            raise RuntimeError("IMAPI2 TrackAtOnce audio interface unavailable on this system")
+        finally:
+            # Always release the media, even if a track write raised, so the
+            # drive is left in a sane state.
+            try:
+                tao.ReleaseMedia()
+            except Exception as e:
+                on_log(f"IMAPI2 ReleaseMedia warning: {e}")
         on_progress(100)
         on_status("Audio CD created successfully (IMAPI2).")
         if eject_after:
