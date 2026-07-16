@@ -70,41 +70,52 @@ class IMAPI2Backend:
         import comtypes.client
         return comtypes.client.CreateObject(progid)
 
-    def _recorder_for(self, device: str):
+    def _recorder_for(self, device: str, on_log: Optional[OnLog] = None):
         """Return an MsftDiscRecorder2 bound to the drive.
 
         `device` on Windows is a drive letter like 'E:' or an IMAPI unique id.
         We map a drive letter to its IMAPI recorder by matching volume paths.
         """
+        def log(m):
+            if on_log:
+                on_log(m)
         import comtypes.client
+        log("_recorder_for: creating MsftDiscMaster2...")
         master = self._new("IMAPI2.MsftDiscMaster2")
+        log("_recorder_for: creating MsftDiscRecorder2...")
         recorder = self._new("IMAPI2.MsftDiscRecorder2")
         want = (device or "").rstrip("\\/").upper()
-        # Try to match the requested drive letter against each recorder's
-        # VolumePathNames; if no match, use the first recorder.
         chosen_id = None
         try:
             count = master.Count
+            log(f"_recorder_for: {count} IMAPI device(s) present")
             for i in range(count):
                 uid = master.Item(i)
                 try:
+                    log(f"_recorder_for: init recorder for device index {i}...")
                     recorder.InitializeDiscRecorder(uid)
                     vols = recorder.VolumePathNames
-                    for v in vols:
-                        if str(v).rstrip("\\/").upper() == want:
+                    vol_list = [str(v).rstrip("\\/").upper() for v in vols]
+                    log(f"_recorder_for: device {i} volumes={vol_list} (want {want})")
+                    for v in vol_list:
+                        if v == want:
                             chosen_id = uid
                             break
-                except Exception:
+                except Exception as e:
+                    log(f"_recorder_for: device {i} probe failed: {e}")
                     continue
                 if chosen_id:
                     break
             if chosen_id is None and count > 0:
+                log("_recorder_for: no volume match; falling back to first device")
                 chosen_id = master.Item(0)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"_recorder_for: enumeration error: {e}")
         if chosen_id is None:
             raise RuntimeError("No optical recorder found via IMAPI2")
+        log("_recorder_for: final InitializeDiscRecorder on chosen device...")
         recorder.InitializeDiscRecorder(chosen_id)
+        log("_recorder_for: recorder ready")
         return recorder
 
     # -- media info / blank / eject ------------------------------------------
@@ -266,14 +277,19 @@ class IMAPI2Backend:
         aborted the burn.)
         """
         on_status("Connecting to burner (IMAPI2)...")
-        recorder = self._recorder_for(device)
+        on_log(f"burn_audio: start, device={device}, tracks={len(wav_files)}")
+        on_log("burn_audio: resolving recorder (enumerating IMAPI2 drives)...")
+        recorder = self._recorder_for(device, on_log=on_log)
+        on_log("burn_audio: recorder resolved OK")
         try:
+            on_log("burn_audio: creating TrackAtOnce formatter...")
             tao = self._new("IMAPI2.MsftDiscFormat2TrackAtOnce")
         except Exception as e:
             raise RuntimeError(f"IMAPI2 TrackAtOnce interface unavailable: {e}")
         if tao is None:
             raise RuntimeError("IMAPI2 TrackAtOnce audio interface unavailable on this system")
 
+        on_log("burn_audio: assigning recorder to formatter...")
         tao.Recorder = recorder
         tao.ClientName = "PyBurn Studio"
         try:
@@ -283,18 +299,25 @@ class IMAPI2Backend:
 
         n = max(1, len(wav_files))
         on_status("Preparing disc for audio burn (IMAPI2)...")
+        on_log("burn_audio: calling PrepareMedia()...")
         tao.PrepareMedia()
+        on_log("burn_audio: PrepareMedia() returned; adding tracks...")
         try:
             for i, wav in enumerate(wav_files, start=1):
                 on_status(f"Writing audio track {i}/{n} (IMAPI2)...")
+                on_log(f"burn_audio: track {i}/{n}: opening stream for {wav}")
                 istream = self._audio_istream_for_wav(wav)
+                on_log(f"burn_audio: track {i}/{n}: AddAudioTrack()...")
                 tao.AddAudioTrack(istream)
+                on_log(f"burn_audio: track {i}/{n}: added OK")
                 on_progress(int((i / n) * 100))
         finally:
             # Always release the media, even if a track write raised, so the
             # drive is left in a sane state.
             try:
+                on_log("burn_audio: calling ReleaseMedia()...")
                 tao.ReleaseMedia()
+                on_log("burn_audio: ReleaseMedia() returned")
             except Exception as e:
                 on_log(f"IMAPI2 ReleaseMedia warning: {e}")
         on_progress(100)
