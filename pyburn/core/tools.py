@@ -2,6 +2,8 @@ from __future__ import annotations
 import shutil
 import subprocess
 from typing import Dict, Optional, List
+
+
 class ToolFinder:
     TOOL_CANDIDATES: Dict[str, List[str]] = {
         "mkisofs": ["mkisofs", "genisoimage"],
@@ -23,8 +25,10 @@ class ToolFinder:
         "cd-discid": ["cd-discid"],
         "tsMuxeR": ["tsMuxeR", "tsmuxer"],
     }
+
     def __init__(self):
         self._resolved: Dict[str, Optional[str]] = {}
+
     def find(self, logical_name: str) -> Optional[str]:
         if logical_name in self._resolved:
             return self._resolved[logical_name]
@@ -35,13 +39,16 @@ class ToolFinder:
                 return path
         self._resolved[logical_name] = None
         return None
+
     def require(self, logical_name: str) -> str:
         exe = self.find(logical_name)
         if not exe:
             raise FileNotFoundError(f"Required tool '{logical_name}' not found")
         return exe
+
     def missing(self, logical_names: List[str]) -> List[str]:
         return [n for n in logical_names if not self.find(n)]
+
     def versions(self) -> Dict[str, Optional[str]]:
         v: Dict[str, Optional[str]] = {}
         for name in self.TOOL_CANDIDATES.keys():

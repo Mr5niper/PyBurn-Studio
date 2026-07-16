@@ -6,10 +6,13 @@ from pathlib import Path
 from typing import Callable, Optional, Set
 from .exec import ProcessRunner
 from ..core.tools import ToolFinder
+
+
 class VerificationTools:
     def __init__(self, tools: ToolFinder, runner: ProcessRunner):
         self.tools = tools
         self.runner = runner
+
     def _sha256(self, p: Path) -> str:
         h = hashlib.sha256()
         with p.open("rb") as f:
@@ -18,6 +21,7 @@ class VerificationTools:
                     raise RuntimeError("Verification cancelled")
                 h.update(chunk)
         return h.hexdigest()
+
     def _monitor_file_growth(self, target: Path, total: int, phase_emit: Callable[[int], None], timeout: float = 120.0):
         start = time.time()
         last = -1
@@ -38,6 +42,7 @@ class VerificationTools:
                     last = pct
             if cur >= total:
                 break
+
     def verify(self, iso_path: Path, device: str, temp_dir: Path,
                on_status: Callable[[str], None], on_log: Callable[[str], None],
                phase_emit: Callable[[int], None]) -> bool:
@@ -65,8 +70,10 @@ class VerificationTools:
             except Exception as e:
                 on_log(f"Readback verify failed ({e}); trying listing compare.")
             finally:
-                try: verify_iso.unlink(missing_ok=True)
-                except Exception: pass
+                try:
+                    verify_iso.unlink(missing_ok=True)
+                except Exception:
+                    pass
         # Level 2: isoinfo listing
         isoinfo = self.tools.find("isoinfo")
         if not isoinfo:

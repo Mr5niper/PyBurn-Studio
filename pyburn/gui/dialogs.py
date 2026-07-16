@@ -7,6 +7,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QTimer
 from ..core.config import Config
 from ..core.devices import DeviceScanner
+
+
 class SettingsDialog(QDialog):
     def __init__(self, cfg: Config, parent: QWidget | None = None):
         super().__init__(parent)
@@ -23,7 +25,7 @@ class SettingsDialog(QDialog):
         row.addWidget(b_scan)
         form.addRow("Disc Device:", row)
         self.spd = QComboBox()
-        self.spd.addItems(["Auto"] + [str(x) for x in [2,4,6,8,12,16,24,32,40,48,52]])
+        self.spd.addItems(["Auto"] + [str(x) for x in [2, 4, 6, 8, 12, 16, 24, 32, 40, 48, 52]])
         self.spd.setCurrentText(str(self.cfg.settings.get("burn_speed", "Auto")))
         form.addRow("Default Burn Speed:", self.spd)
         self.temp = QLineEdit(cfg.settings.get("temp_dir", str(Path.home() / "PyBurn_Temp")))
@@ -53,11 +55,13 @@ class SettingsDialog(QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
+
     def _populate(self):
         # Non-blocking device scan with indicator
         self.cbo_dev.clear()
         self.cbo_dev.addItem("Scanning devices...")
         QTimer.singleShot(100, self._scan_async)
+
     def _scan_async(self):
         try:
             devs = DeviceScanner().scan_devices()
@@ -72,10 +76,12 @@ class SettingsDialog(QDialog):
                 idx = i
         if idx >= 0:
             self.cbo_dev.setCurrentIndex(idx)
+
     def _choose(self):
         d = QFileDialog.getExistingDirectory(self, "Choose Temporary Directory")
         if d:
             self.temp.setText(d)
+
     def accept(self):
         i = self.cbo_dev.currentIndex()
         if i >= 0:
@@ -102,6 +108,8 @@ class SettingsDialog(QDialog):
         self.cfg.settings["musicbrainz_enabled"] = self.chk_mb.isChecked()
         self.cfg.save()
         super().accept()
+
+
 class LogDialog(QDialog):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -111,5 +119,6 @@ class LogDialog(QDialog):
         self.text = QTextEdit()
         self.text.setReadOnly(True)
         lay.addWidget(self.text)
+
     def append(self, line: str):
         self.text.append(line)

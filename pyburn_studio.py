@@ -6,10 +6,22 @@ from pyburn.core.config import Config
 from pyburn.core.tools import ToolFinder
 from pyburn.gui.main_window import MainWindow
 from pyburn.style import APP_STYLESHEET
+from pyburn.resources import app_icon, set_windows_app_id
+
+
 def run_gui():
+    # On Windows, claim a distinct app identity BEFORE the QApplication and any
+    # window exist, so the taskbar uses our icon instead of the generic Python
+    # one and groups the app under its own button.
+    set_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName("PyBurn Studio")
     app.setStyleSheet(APP_STYLESHEET)
+    # App-level icon: every top-level window and message box inherits this
+    # unless it sets its own, so this covers dialogs and popups automatically.
+    icon = app_icon()
+    if icon is not None:
+        app.setWindowIcon(icon)
     cfg = Config()
     tools = ToolFinder()
     if not cfg.settings.get("simulate_when_missing_tools", True):
@@ -21,6 +33,8 @@ def run_gui():
     win = MainWindow(cfg, tools)
     win.show()
     sys.exit(app.exec())
+
+
 def self_test():
     from PyQt6.QtWidgets import QApplication
     from pyburn.services.queue import JobQueueService
@@ -36,8 +50,10 @@ def self_test():
     results = []
     q.sig_job_finished.connect(lambda jid, ok, msg: (results.append(ok), print("Finished:", jid, ok, msg)))
     dummy = Path.cwd() / "dummy.txt"
-    try: dummy.write_text("x")
-    except Exception: pass
+    try:
+        dummy.write_text("x")
+    except Exception:
+        pass
     q.enqueue(Job(job_type=JobType.DATA, files=[dummy], device="/dev/sr0",
                   options=JobOptions(temp_dir=Path(cfg.settings["temp_dir"]), verify=True, speed="Auto", volume_label="TEST")))
     q.enqueue(Job(job_type=JobType.AUDIO, files=[dummy], device="/dev/sr0",
@@ -50,25 +66,34 @@ def self_test():
                   options=JobOptions(temp_dir=Path(cfg.settings["temp_dir"]), speed="Auto")))
     start = time.time()
     timeout = 30.0
-    while q.get_list() or (q._thread and q._thread.isRunning()):
+    expected = 5
+    while len(results) < expected:
         app.processEvents()
         time.sleep(0.05)
         if time.time() - start > timeout:
             print("ERROR: Self-test timed out; cancelling current job and shutting down.")
             q.cancel_current()
-            if q._thread:
-                q._thread.quit()
-                q._thread.wait(2000)
+            # Give the queue a moment to unwind the cancelled job cleanly.
+            deadline = time.time() + 3.0
+            while q.get_list() and time.time() < deadline:
+                app.processEvents()
+                time.sleep(0.05)
             break
-    try: dummy.unlink()
-    except Exception: pass
-    try: (Path.cwd() / "out").rmdir()
-    except Exception: pass
-    if len(results) < 5 or not all(results):
+    try:
+        dummy.unlink()
+    except Exception:
+        pass
+    try:
+        (Path.cwd() / "out").rmdir()
+    except Exception:
+        pass
+    if len(results) < expected or not all(results):
         print("FAIL: Self-test did not complete successfully.")
         return 1
-    print("✓ Self-test passed.")
+    print("Self-test passed.")
     return 0
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PyBurn Studio")
     parser.add_argument("--self-test", action="store_true", help="Run built-in non-destructive self-tests")

@@ -4,6 +4,7 @@ import re
 import platform
 from pathlib import Path
 from typing import Any, Dict
+
 DEFAULT_CONFIG = {
     "burn_speed": "Auto",
     "verify_after_burn": True,
@@ -19,11 +20,14 @@ DEFAULT_CONFIG = {
     "logs_dir": str(Path.home() / ".pyburn_logs"),
     "musicbrainz_enabled": True,
 }
+
+
 class Config:
     def __init__(self, path: Path | None = None):
         self.path = path or Path.home() / ".pyburn_config.json"
         self.settings: Dict[str, Any] = {}
         self.load()
+
     def load(self):
         self.settings = dict(DEFAULT_CONFIG)
         if self.path.exists():
@@ -58,6 +62,7 @@ class Config:
 
         Path(self.settings["temp_dir"]).mkdir(parents=True, exist_ok=True)
         Path(self.settings["logs_dir"]).mkdir(parents=True, exist_ok=True)
+
     def save(self):
         try:
             Path(self.settings["temp_dir"]).mkdir(parents=True, exist_ok=True)
