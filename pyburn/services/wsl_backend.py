@@ -145,6 +145,19 @@ class WSLAuthorBackend:
         work = self._work_win_dir()
         wsl_work = self.wsl.win_to_wsl_path(str(work))
         on_status("Preparing Blu-ray authoring in WSL2...")
+        # Fit-to-disc bitrate (mirrors the DVD path): compute an H.264 bitrate
+        # that fills a BD-25 for the TOTAL runtime instead of a fixed CRF, so
+        # capacity is predictable and longer content fits at a lower bitrate.
+        from ..gui.widgets import bd_video_kbps_for_seconds, BD_AUDIO_KBPS
+        total_seconds = 0.0
+        try:
+            total_seconds = self._probe_total_seconds_wsl(files, on_log)
+        except Exception:
+            total_seconds = 0.0
+        video_kbps = bd_video_kbps_for_seconds(total_seconds)
+        maxrate = min(38000, int(video_kbps * 1.4))
+        bufsize = maxrate * 2
+        on_log(f"BD fit-to-disc: total runtime {int(total_seconds)}s -> video {video_kbps} kbps, audio {BD_AUDIO_KBPS} kbps")
         ts_wsl = []
         n = max(1, len(files))
         for idx, src in enumerate(files, start=1):
@@ -154,8 +167,9 @@ class WSLAuthorBackend:
             out_ts = f"{wsl_work}/clip_{idx:02d}.ts"
             on_status(f"Transcoding video {idx}/{n} for BDMV (WSL2 ffmpeg)...")
             rc = self.wsl.run(
-                ["ffmpeg", "-y", "-i", src_wsl, "-c:v", "libx264", "-preset", "veryfast",
-                 "-crf", "20", "-c:a", "ac3", "-b:a", "192k", "-pix_fmt", "yuv420p", "-f", "mpegts", out_ts],
+                ["ffmpeg", "-nostdin", "-y", "-i", src_wsl, "-c:v", "libx264", "-preset", "veryfast",
+                 "-b:v", f"{video_kbps}k", "-maxrate", f"{maxrate}k", "-bufsize", f"{bufsize}k",
+                 "-c:a", "ac3", "-b:a", f"{BD_AUDIO_KBPS}k", "-pix_fmt", "yuv420p", "-f", "mpegts", out_ts],
                 on_out=on_log, on_err=on_log,
             )
             if rc != 0:

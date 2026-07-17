@@ -110,6 +110,37 @@ def dvd_max_minutes() -> float:
     return seconds / 60.0
 
 
+# --- Blu-ray (BD-25) fit-to-disc bitrate model ------------------------------
+# Same idea as DVD, sized for a single-layer 25 GB Blu-ray with H.264 video and
+# AC3 audio. The BD path formerly used a fixed CRF (quality-based, so output
+# size varied with content and could not map to a time budget); switching to a
+# fit-to-disc bitrate makes capacity predictable and lets long content fit by
+# lowering the bitrate, exactly like the DVD path.
+BD25_USABLE_BYTES = 23_500_000_000   # usable BD-25 (~23.3 GiB), conservative
+BD_AUDIO_KBPS = 192                  # AC3 audio
+BD_MUX_OVERHEAD = 0.97               # BDMV/m2ts overhead
+BD_VIDEO_MAX_KBPS = 35000            # headroom under the ~40 Mbps BD ceiling
+BD_VIDEO_MIN_KBPS = 6000             # H.264 1080p quality floor; sets max runtime
+
+
+def bd_video_kbps_for_seconds(seconds: float) -> int:
+    """Video bitrate (kbps) that fills a BD-25 for the given runtime, clamped
+    between the quality floor and the BD ceiling."""
+    if seconds <= 0:
+        return BD_VIDEO_MAX_KBPS
+    total_kbits = BD25_USABLE_BYTES * 8 * BD_MUX_OVERHEAD / 1000.0
+    avail_video_kbits = total_kbits - (BD_AUDIO_KBPS * seconds)
+    kbps = avail_video_kbits / seconds if seconds > 0 else BD_VIDEO_MAX_KBPS
+    return max(BD_VIDEO_MIN_KBPS, min(BD_VIDEO_MAX_KBPS, int(kbps)))
+
+
+def bd_max_minutes() -> float:
+    """Runtime at which the BD video bitrate hits the quality floor."""
+    total_kbits = BD25_USABLE_BYTES * 8 * BD_MUX_OVERHEAD / 1000.0
+    seconds = total_kbits / (BD_VIDEO_MIN_KBPS + BD_AUDIO_KBPS)
+    return seconds / 60.0
+
+
 class FileListWidget(QListWidget):
     files_changed = pyqtSignal(list)
 
