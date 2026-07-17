@@ -216,7 +216,7 @@ class IMAPI2Backend:
 
     def burn_data(self, files: List[Path], device: str, temp_dir: Path, volume: str,
                   on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
-                  auto_blank: bool = True, eject_after: bool = True) -> None:
+                  auto_blank: bool = True, eject_after: bool = True, speed="Auto") -> None:
         """Build a data image from files/folders and burn it, all via IMAPI2."""
         on_log(f"burn_data: start, device={device}, items={len(files)}")
         on_log("burn_data: resolving recorder...")
@@ -230,19 +230,29 @@ class IMAPI2Backend:
         on_status("Building data image (IMAPI2)...")
         on_log("burn_data: creating MsftFileSystemImage...")
         fsi = self._new("IMAPI2FS.MsftFileSystemImage")
-        try:
-            fsi.FreeMediaBlocks = -1  # let IMAPI size to media
-        except Exception as e:
-            on_log(f"burn_data: FreeMediaBlocks warning: {e}")
-        try:
-            fsi.VolumeName = (volume or "DATA_DISC")[:32]
-        except Exception as e:
-            on_log(f"burn_data: VolumeName warning: {e}")
+        # ChooseImageDefaults(recorder) MUST run first: it inspects the disc in
+        # the drive and configures the image (file-system types, block count,
+        # media size) to match. Setting FreeMediaBlocks by hand afterwards is
+        # wrong; the previous code set it to -1, which is not "size to media" but
+        # a bogus block count, so the image was built for the wrong size and the
+        # drive rejected the write with an unrecoverable error. Let
+        # ChooseImageDefaults own the sizing.
         try:
             on_log("burn_data: ChooseImageDefaults(recorder)...")
             fsi.ChooseImageDefaults(recorder)
         except Exception as e:
             on_log(f"burn_data: ChooseImageDefaults warning: {e}")
+        try:
+            fsi.VolumeName = (volume or "DATA_DISC")[:32]
+        except Exception as e:
+            on_log(f"burn_data: VolumeName warning: {e}")
+        # For a fresh single-session burn, import no previous session and mark
+        # the file-system types explicitly for broad readability.
+        try:
+            # FsiFileSystemISO9660 (1) | FsiFileSystemJoliet (2) | FsiFileSystemUDF (4) = 7
+            fsi.FileSystemsToCreate = 7
+        except Exception as e:
+            on_log(f"burn_data: FileSystemsToCreate warning: {e}")
         root = fsi.Root
         added = self._add_tree(root, files, on_log)
         if added == 0:
@@ -257,6 +267,28 @@ class IMAPI2Backend:
         data = self._new("IMAPI2.MsftDiscFormat2Data")
         data.Recorder = recorder
         data.ClientName = "PyBurn Studio"
+        # Log what the drive/media supports for diagnostics, but let IMAPI2
+        # choose the actual write speed (its default). The earlier data-burn
+        # failure was a mis-sized image, not a speed problem, so there is no need
+        # to force a slow speed; forcing the slowest advertised speed only made
+        # burns needlessly slow.
+        try:
+            cur = getattr(data, "CurrentMediaType", None)
+            on_log(f"burn_data: current media type = {cur}")
+        except Exception as e:
+            on_log(f"burn_data: media type query warning: {e}")
+        try:
+            descriptors = data.SupportedWriteSpeedDescriptors
+            speeds = []
+            for d in descriptors:
+                try:
+                    speeds.append((int(d.MediaType), int(d.WriteSpeed), int(d.RotationTypeIsPureCAV)))
+                except Exception:
+                    pass
+            on_log(f"burn_data: supported write-speed descriptors = {speeds}")
+        except Exception as e:
+            on_log(f"burn_data: write-speed query warning: {e}")
+        self._apply_write_speed(data, speed, on_log)
         try:
             self._wire_progress(data, on_progress)
         except Exception:
@@ -303,7 +335,7 @@ class IMAPI2Backend:
 
     def burn_audio(self, wav_files: List[Path], device: str,
                    on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
-                   eject_after: bool = True) -> None:
+                   eject_after: bool = True, speed="Auto") -> None:
         """Burn Red Book audio tracks from 44100/16-bit stereo WAV files.
 
         Uses the TrackAtOnce interface. PrepareMedia() is called EXACTLY ONCE
@@ -328,6 +360,7 @@ class IMAPI2Backend:
         on_log("burn_audio: assigning recorder to formatter...")
         tao.Recorder = recorder
         tao.ClientName = "PyBurn Studio"
+        self._apply_write_speed(tao, speed, on_log)
         try:
             self._wire_progress(tao, on_progress, audio=True)
         except Exception:
@@ -476,6 +509,48 @@ class IMAPI2Backend:
         except Exception:
             # On any parsing trouble, fall back to the raw file stream.
             return self._istream_for_file(wav)
+
+    def _apply_write_speed(self, formatter, speed, on_log: OnLog):
+        """Honor the user's Setup burn-speed choice on an IMAPI2 formatter.
+
+        `speed` is either "Auto" (let IMAPI2 pick, the default) or a CD-style
+        x-multiplier string like "8", "16", "24". One CD "x" is 150 KB/s, so we
+        convert and pick the supported descriptor closest to (but not above) the
+        requested KB/s. If anything is unavailable we leave IMAPI2 on its
+        default rather than fail the burn.
+        """
+        try:
+            if speed is None:
+                return
+            s = str(speed).strip().lower()
+            if s in ("", "auto"):
+                on_log("burn: write speed = Auto (IMAPI2 default)")
+                return
+            mult = int(float(s))
+            want_kbps = mult * 150  # 1x CD = 150 KB/s
+            # Find the closest supported speed at or below the request.
+            best = None
+            try:
+                for d in formatter.SupportedWriteSpeedDescriptors:
+                    ws = int(d.WriteSpeed)
+                    if ws <= want_kbps and (best is None or ws > best[0]):
+                        best = (ws, d)
+                # If none at or below, take the slowest available.
+                if best is None:
+                    for d in formatter.SupportedWriteSpeedDescriptors:
+                        ws = int(d.WriteSpeed)
+                        if best is None or ws < best[0]:
+                            best = (ws, d)
+            except Exception:
+                best = None
+            if best is not None:
+                rot = getattr(best[1], "RotationTypeIsPureCAV", False)
+                on_log(f"burn: requested {mult}x (~{want_kbps} KB/s); setting {best[0]} KB/s")
+                formatter.SetWriteSpeed(best[0], rot)
+            else:
+                on_log(f"burn: requested {mult}x (~{want_kbps} KB/s); no descriptors, using default")
+        except Exception as e:
+            on_log(f"burn: write-speed selection warning: {e}")
 
     def _wire_progress(self, formatter, on_progress: OnProgress, audio: bool = False):
         """Best-effort connect an IMAPI2 progress event sink.
