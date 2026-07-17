@@ -40,15 +40,56 @@ class WSLAuthorBackend:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def _probe_total_seconds_wsl(self, files, on_log) -> float:
+        """Sum the durations of all source files by running ffprobe inside WSL2.
+        Used to pick the fit-to-disc DVD bitrate. Returns 0.0 if probing fails,
+        in which case the caller falls back to the max (highest-quality) rate."""
+        total = 0.0
+        for src in files:
+            src_wsl = self.wsl.win_to_wsl_path(str(src))
+            captured = {"val": ""}
+
+            def grab(line, _c=captured):
+                s = (line or "").strip()
+                if s:
+                    _c["val"] = s
+
+            rc = self.wsl.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", src_wsl],
+                on_out=grab, on_err=on_log,
+            )
+            try:
+                if rc == 0 and captured["val"]:
+                    total += float(captured["val"])
+            except Exception:
+                pass
+        return total
+
     def burn_video_dvd(self, files: List[Path], device: str, on_status: OnStatus,
                        on_progress: OnProgress, on_log: OnLog,
                        auto_blank: bool = True, eject_after: bool = True) -> None:
         work = self._work_win_dir()
         wsl_work = self.wsl.win_to_wsl_path(str(work))
         on_status("Preparing DVD authoring in WSL2...")
-        # 1) Transcode each input to DVD-compliant MPEG inside WSL2.
+        # Fit-to-disc bitrate: instead of a fixed pal-dvd 6 Mbps (which caps
+        # runtime at ~100 min), compute a video bitrate that fills a DVD-5 for
+        # the TOTAL runtime of all titles. Longer content gets a lower bitrate,
+        # exactly like real DVD authoring, so several hours can fit one disc.
+        from ..gui.widgets import dvd_video_kbps_for_seconds, DVD_AUDIO_KBPS
+        total_seconds = 0.0
+        try:
+            total_seconds = self._probe_total_seconds_wsl(files, on_log)
+        except Exception:
+            total_seconds = 0.0
+        video_kbps = dvd_video_kbps_for_seconds(total_seconds)
+        on_log(f"DVD fit-to-disc: total runtime {int(total_seconds)}s -> video {video_kbps} kbps, audio {DVD_AUDIO_KBPS} kbps")
+        # 1) Transcode each input to DVD-compliant MPEG inside WSL2 at the
+        #    computed bitrate. -target pal-dvd still sets the DVD-legal format
+        #    (resolution, GOP, muxing); -b:v / -maxrate override its bitrate.
         mpegs_wsl = []
         n = max(1, len(files))
+        maxrate = min(9000, video_kbps + 1000)
         for idx, src in enumerate(files, start=1):
             if self._cancelled:
                 raise RuntimeError("cancelled")
@@ -56,7 +97,9 @@ class WSLAuthorBackend:
             mpg_wsl = f"{wsl_work}/title_{idx:02d}.mpg"
             on_status(f"Transcoding video {idx}/{n} (WSL2 ffmpeg)...")
             rc = self.wsl.run(
-                ["ffmpeg", "-y", "-i", src_wsl, "-target", "pal-dvd", "-aspect", "16:9", mpg_wsl],
+                ["ffmpeg", "-y", "-i", src_wsl, "-target", "pal-dvd", "-aspect", "16:9",
+                 "-b:v", f"{video_kbps}k", "-maxrate", f"{maxrate}k", "-minrate", "0",
+                 "-bufsize", "1835008", "-b:a", f"{DVD_AUDIO_KBPS}k", mpg_wsl],
                 on_out=on_log, on_err=on_log,
             )
             if rc != 0:
