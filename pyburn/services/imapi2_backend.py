@@ -218,29 +218,42 @@ class IMAPI2Backend:
                   on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
                   auto_blank: bool = True, eject_after: bool = True) -> None:
         """Build a data image from files/folders and burn it, all via IMAPI2."""
-        recorder = self._recorder_for(device)
+        on_log(f"burn_data: start, device={device}, items={len(files)}")
+        on_log("burn_data: resolving recorder...")
+        recorder = self._recorder_for(device, on_log=on_log)
+        on_log("burn_data: recorder resolved OK")
         info = self.get_media_info(device)
+        on_log(f"burn_data: media info blank={info.get('blank')} rewritable={info.get('rewritable')}")
         if auto_blank and info.get("blank") is False:
+            on_log("burn_data: media not blank, blanking...")
             self.blank(device, on_status, on_log)
         on_status("Building data image (IMAPI2)...")
+        on_log("burn_data: creating MsftFileSystemImage...")
         fsi = self._new("IMAPI2FS.MsftFileSystemImage")
         try:
             fsi.FreeMediaBlocks = -1  # let IMAPI size to media
-        except Exception:
-            pass
+        except Exception as e:
+            on_log(f"burn_data: FreeMediaBlocks warning: {e}")
         try:
             fsi.VolumeName = (volume or "DATA_DISC")[:32]
-        except Exception:
-            pass
-        # Choose Joliet + ISO9660 + UDF for broad compatibility.
+        except Exception as e:
+            on_log(f"burn_data: VolumeName warning: {e}")
         try:
+            on_log("burn_data: ChooseImageDefaults(recorder)...")
             fsi.ChooseImageDefaults(recorder)
-        except Exception:
-            pass
+        except Exception as e:
+            on_log(f"burn_data: ChooseImageDefaults warning: {e}")
         root = fsi.Root
-        self._add_tree(root, files, on_log)
-        result = fsi.CreateResultImage()
-        image_stream = result.ImageStream
+        added = self._add_tree(root, files, on_log)
+        if added == 0:
+            raise RuntimeError("No files could be added to the data image; nothing to burn.")
+        on_log(f"burn_data: added {added} item(s); creating result image...")
+        try:
+            result = fsi.CreateResultImage()
+            image_stream = result.ImageStream
+        except Exception as e:
+            raise RuntimeError(f"Failed to build the data image: {e!r}")
+        on_log("burn_data: creating MsftDiscFormat2Data...")
         data = self._new("IMAPI2.MsftDiscFormat2Data")
         data.Recorder = recorder
         data.ClientName = "PyBurn Studio"
@@ -249,32 +262,44 @@ class IMAPI2Backend:
         except Exception:
             pass
         on_status("Burning data disc (IMAPI2)...")
+        on_log("burn_data: calling Write(image_stream)...")
+        burn_error = None
         try:
             data.Write(image_stream)
+            on_log("burn_data: Write() returned OK")
             on_progress(100)
             on_status("Data disc burned successfully (IMAPI2).")
+        except Exception as e:
+            burn_error = e
+            on_log(f"burn_data: FAILED Write: {e!r}")
         finally:
             if eject_after:
                 try:
+                    on_log("burn_data: ejecting media...")
                     recorder.EjectMedia()
                 except Exception:
                     pass
+        if burn_error is not None:
+            raise RuntimeError(f"Data disc burn failed: {burn_error}")
 
-    def _add_tree(self, dir_item, files: List[Path], on_log: OnLog):
-        """Recursively add files/dirs into an IMAPI file system image directory."""
+    def _add_tree(self, dir_item, files: List[Path], on_log: OnLog) -> int:
+        """Recursively add files/dirs into an IMAPI file system image directory.
+        Returns the number of items successfully added."""
+        added = 0
         for p in files:
             try:
                 if p.is_dir():
-                    # AddTree adds the directory contents under a named subdir.
+                    on_log(f"burn_data: AddTree {p}")
                     dir_item.AddTree(str(p), False)
+                    added += 1
                 elif p.is_file():
-                    with open(p, "rb"):
-                        pass
-                    # AddFile takes a path relative in the image and an IStream.
+                    on_log(f"burn_data: AddFile {p.name}")
                     istream = self._istream_for_file(p)
                     dir_item.AddFile(p.name, istream)
+                    added += 1
             except Exception as e:
-                on_log(f"IMAPI2 add failed for {p}: {e}")
+                on_log(f"burn_data: add FAILED for {p}: {e!r}")
+        return added
 
     def burn_audio(self, wav_files: List[Path], device: str,
                    on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
