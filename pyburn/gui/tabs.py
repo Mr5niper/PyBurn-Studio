@@ -12,12 +12,15 @@ from PyQt6.QtGui import QFont
 from ..core.config import Config
 from ..core.jobs import Job, JobOptions, JobType
 from ..core.tools import ToolFinder
-from .widgets import FileListWidget, CapacityGauge, compute_total_size, compute_total_duration
+from .widgets import FileListWidget, CapacityGauge, compute_total_size, compute_total_duration, dvd_max_minutes
 from ..services.queue import JobQueueService
 from ..services.metadata import musicbrainz_lookup
 from ..services.media import MediaTools
 from ..services.exec import ProcessRunner
 
+# CD_BYTES / DVD_BYTES are byte capacities used by the data-disc gauge. Video
+# DVD capacity is time-based and computed by the fit-to-disc model in widgets.py
+# (dvd_max_minutes), so there is no fixed DVD minutes constant here anymore.
 CD_BYTES = 737_280_000
 DVD_BYTES = 4_700_000_000
 BD25_BYTES = 25_000_000_000
@@ -409,7 +412,7 @@ class VideoDVDTab(BaseTab):
         for b in (b_add, b_rm, b_cl):
             row.addWidget(b)
         lay.addLayout(row)
-        self.gauge = CapacityGauge(DVD_BYTES)
+        self.gauge = CapacityGauge(DVD_BYTES, mode="minutes", max_minutes=dvd_max_minutes())
         lay.addWidget(self.gauge)
         self.chk_blank = QCheckBox("Auto-blank RW media")
         self.chk_blank.setChecked(bool(self.cfg.settings.get("auto_blank_rw", True)))
@@ -426,7 +429,47 @@ class VideoDVDTab(BaseTab):
         self._refresh(self.list.get_file_list())
 
     def _refresh(self, files: List[str]):
-        self.gauge.update_size(compute_total_size(files))
+        # Video DVD capacity is governed by playback time at the fixed pal-dvd
+        # transcode bitrate, NOT by the compressed source size (an h.264 MP4 and
+        # a much larger MKV of the same length produce nearly identical MPEG-2).
+        # Measure total duration with ffprobe in a background thread so dropping
+        # in long videos does not freeze the UI, exactly like the audio CD tab.
+        ffprobe = self.tools.find("ffprobe")
+        file_list = list(files)
+        if not file_list:
+            self.gauge.update_duration(0.0)
+            return
+
+        if not hasattr(self, "_dur_threads"):
+            self._dur_threads = set()
+
+        class DurThread(QThread):
+            done = pyqtSignal(float)
+
+            def __init__(self, paths, probe):
+                super().__init__()
+                self.paths = paths
+                self.probe = probe
+
+            def run(self):
+                try:
+                    secs = compute_total_duration(self.paths, self.probe)
+                except Exception:
+                    secs = 0.0
+                self.done.emit(secs)
+
+        thread = DurThread(file_list, ffprobe)
+
+        def on_done(secs, th=thread):
+            try:
+                self.gauge.update_duration(secs if secs and secs > 0 else 0.0)
+            finally:
+                self._dur_threads.discard(th)
+
+        thread.done.connect(on_done)
+        thread.finished.connect(lambda th=thread: self._dur_threads.discard(th))
+        self._dur_threads.add(thread)
+        thread.start()
 
     def _confirm_blank_if_needed(self, device: str) -> bool:
         if not self.chk_blank.isChecked():
@@ -459,17 +502,30 @@ class VideoDVDTab(BaseTab):
         if self.list.count() == 0:
             QMessageBox.warning(self, "No Files", "Add video files.")
             return
+        # DVD-Video capacity is playback time at the pal-dvd bitrate (~100 min on
+        # a single layer). Warn if the total runtime exceeds that.
+        if self.gauge.current_seconds > self.gauge.max_minutes * 60.0:
+            r = QMessageBox.question(
+                self, "Over Capacity",
+                f"Total video runtime is {int(self.gauge.current_seconds // 60)} min, which "
+                f"exceeds the ~{int(self.gauge.max_minutes)}-minute single-layer DVD limit.\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                return
         device = self.cfg.settings.get("default_device", "/dev/sr0")
         if not self._confirm_blank_if_needed(device):
             QMessageBox.information(self, "Cancelled", "Blanking cancelled. Job not queued.")
             return
         temp_dir = Path(self.cfg.settings["temp_dir"])
-        needed = max(1, self.gauge.current_size)
+        # With fit-to-disc bitrate the authored output is always about one full
+        # DVD (~4.7 GB) regardless of runtime; authoring + ISO roughly doubles
+        # that on disk at peak.
+        needed = DVD_BYTES
         free = disk_free_bytes(temp_dir)
-        # Video authoring: 2.5x
-        if free < needed * 2.5:
+        if free < needed * 2.0:
             r = QMessageBox.question(self, "Low Temp Space",
-                                     "Transcoding may require large temporary space.\nContinue?",
+                                     f"DVD authoring needs about {needed*2.0/1e9:.1f} GB free; "
+                                     f"about {free/1e9:.1f} GB available.\nContinue?",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if r != QMessageBox.StandardButton.Yes:
                 return

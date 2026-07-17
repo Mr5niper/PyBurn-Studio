@@ -78,6 +78,38 @@ def compute_total_duration(paths: List[str], ffprobe: Optional[str]) -> float:
     return total
 
 
+# --- DVD-Video fit-to-disc bitrate model ------------------------------------
+# A single-layer DVD holds a fixed number of bits; how many MINUTES fit depends
+# on the video bitrate. Real DVD authoring picks a bitrate that fills the disc
+# for the given runtime (lower bitrate = longer runtime), rather than a fixed
+# rate. These constants and helpers are the single source of truth shared by
+# the capacity gauge (UI) and the WSL transcode (bitrate actually used).
+DVD5_USABLE_BYTES = 4_700_000_000   # single-layer DVD-5
+DVD_AUDIO_KBPS = 224                # MP2/AC3 DVD audio
+DVD_MUX_OVERHEAD = 0.98             # ~2% for VOB/nav-pack overhead
+DVD_VIDEO_MAX_KBPS = 9000           # headroom under the ~9.8 Mbps DVD ceiling
+DVD_VIDEO_MIN_KBPS = 2000           # quality floor; sets the practical max runtime
+
+
+def dvd_video_kbps_for_seconds(seconds: float) -> int:
+    """Video bitrate (kbps) that fills a DVD-5 for the given runtime, clamped
+    between the quality floor and the DVD ceiling."""
+    if seconds <= 0:
+        return DVD_VIDEO_MAX_KBPS
+    total_kbits = DVD5_USABLE_BYTES * 8 * DVD_MUX_OVERHEAD / 1000.0
+    avail_video_kbits = total_kbits - (DVD_AUDIO_KBPS * seconds)
+    kbps = avail_video_kbits / seconds if seconds > 0 else DVD_VIDEO_MAX_KBPS
+    return max(DVD_VIDEO_MIN_KBPS, min(DVD_VIDEO_MAX_KBPS, int(kbps)))
+
+
+def dvd_max_minutes() -> float:
+    """Runtime at which the video bitrate hits the quality floor. Past this, the
+    content will not fit a single-layer DVD at acceptable quality."""
+    total_kbits = DVD5_USABLE_BYTES * 8 * DVD_MUX_OVERHEAD / 1000.0
+    seconds = total_kbits / (DVD_VIDEO_MIN_KBPS + DVD_AUDIO_KBPS)
+    return seconds / 60.0
+
+
 class FileListWidget(QListWidget):
     files_changed = pyqtSignal(list)
 
