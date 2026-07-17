@@ -12,7 +12,7 @@ from PyQt6.QtGui import QFont
 from ..core.config import Config
 from ..core.jobs import Job, JobOptions, JobType
 from ..core.tools import ToolFinder
-from .widgets import FileListWidget, CapacityGauge, compute_total_size, compute_total_duration, dvd_max_minutes
+from .widgets import FileListWidget, CapacityGauge, compute_total_size, compute_total_duration, dvd_max_minutes, bd_max_minutes
 from ..services.queue import JobQueueService
 from ..services.metadata import musicbrainz_lookup
 from ..services.media import MediaTools
@@ -561,7 +561,7 @@ class VideoBDTab(BaseTab):
         for b in (b_add, b_rm, b_cl):
             row.addWidget(b)
         lay.addLayout(row)
-        self.gauge = CapacityGauge(BD25_BYTES)
+        self.gauge = CapacityGauge(BD25_BYTES, mode="minutes", max_minutes=bd_max_minutes())
         lay.addWidget(self.gauge)
         self.chk_blank = QCheckBox("Auto-blank RW media")
         self.chk_blank.setChecked(bool(self.cfg.settings.get("auto_blank_rw", True)))
@@ -578,7 +578,45 @@ class VideoBDTab(BaseTab):
         self._refresh(self.list.get_file_list())
 
     def _refresh(self, files: List[str]):
-        self.gauge.update_size(compute_total_size(files))
+        # Blu-ray capacity, like DVD, is governed by playback time at the
+        # fit-to-disc transcode bitrate, not by the compressed source size.
+        # Measure total duration with ffprobe in a background thread.
+        ffprobe = self.tools.find("ffprobe")
+        file_list = list(files)
+        if not file_list:
+            self.gauge.update_duration(0.0)
+            return
+
+        if not hasattr(self, "_dur_threads"):
+            self._dur_threads = set()
+
+        class DurThread(QThread):
+            done = pyqtSignal(float)
+
+            def __init__(self, paths, probe):
+                super().__init__()
+                self.paths = paths
+                self.probe = probe
+
+            def run(self):
+                try:
+                    secs = compute_total_duration(self.paths, self.probe)
+                except Exception:
+                    secs = 0.0
+                self.done.emit(secs)
+
+        thread = DurThread(file_list, ffprobe)
+
+        def on_done(secs, th=thread):
+            try:
+                self.gauge.update_duration(secs if secs and secs > 0 else 0.0)
+            finally:
+                self._dur_threads.discard(th)
+
+        thread.done.connect(on_done)
+        thread.finished.connect(lambda th=thread: self._dur_threads.discard(th))
+        self._dur_threads.add(thread)
+        thread.start()
 
     def _confirm_blank_if_needed(self, device: str) -> bool:
         if not self.chk_blank.isChecked():
@@ -611,16 +649,29 @@ class VideoBDTab(BaseTab):
         if self.list.count() == 0:
             QMessageBox.warning(self, "No Files", "Add video files.")
             return
+        # BD capacity is playback time at the fit-to-disc bitrate; warn if the
+        # total runtime exceeds what fits at acceptable quality.
+        if self.gauge.current_seconds > self.gauge.max_minutes * 60.0:
+            r = QMessageBox.question(
+                self, "Over Capacity",
+                f"Total video runtime is {int(self.gauge.current_seconds // 60)} min, which "
+                f"exceeds the ~{int(self.gauge.max_minutes)}-minute single-layer Blu-ray limit.\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                return
         device = self.cfg.settings.get("default_device", "/dev/sr0")
         if not self._confirm_blank_if_needed(device):
             QMessageBox.information(self, "Cancelled", "Blanking cancelled. Job not queued.")
             return
         temp_dir = Path(self.cfg.settings["temp_dir"])
-        needed = max(1, self.gauge.current_size)
+        # Fit-to-disc output is about one full BD-25 (~23.5 GB) regardless of
+        # runtime; authoring + image roughly doubles that on disk at peak.
+        needed = BD25_BYTES
         free = disk_free_bytes(temp_dir)
-        if free < needed * 2.5:
+        if free < needed * 2.0:
             r = QMessageBox.question(self, "Low Temp Space",
-                                     "BD authoring may require large temporary space.\nContinue?",
+                                     f"Blu-ray authoring needs about {needed*2.0/1e9:.1f} GB free; "
+                                     f"about {free/1e9:.1f} GB available.\nContinue?",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if r != QMessageBox.StandardButton.Yes:
                 return
