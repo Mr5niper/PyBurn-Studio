@@ -12,7 +12,7 @@ from PyQt6.QtGui import QFont
 from ..core.config import Config
 from ..core.jobs import Job, JobOptions, JobType
 from ..core.tools import ToolFinder
-from .widgets import FileListWidget, CapacityGauge, compute_total_size
+from .widgets import FileListWidget, CapacityGauge, compute_total_size, compute_total_duration
 from ..services.queue import JobQueueService
 from ..services.metadata import musicbrainz_lookup
 from ..services.media import MediaTools
@@ -102,7 +102,7 @@ class DataBurnTab(BaseTab):
         lay.addWidget(opts)
         self.gauge = CapacityGauge(DVD_BYTES)
         lay.addWidget(self.gauge)
-        self.btn = QPushButton("Queue Job: Burn Data Disc")
+        self.btn = QPushButton("Burn Data Disc")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -201,7 +201,7 @@ class DataBurnTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
 
 
 class AudioCDTab(BaseTab):
@@ -239,12 +239,12 @@ class AudioCDTab(BaseTab):
         self.btn_guess = QPushButton("Guess Track Titles From Filenames")
         self.btn_guess.clicked.connect(self._guess_titles)
         lay.addWidget(self.btn_guess)
-        self.gauge = CapacityGauge(CD_BYTES)
+        self.gauge = CapacityGauge(CD_BYTES, mode="minutes", max_minutes=80.0)
         lay.addWidget(self.gauge)
         self.chk_eject = QCheckBox("Eject after burn")
         self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
         lay.addWidget(self.chk_eject)
-        self.btn = QPushButton("Queue Job: Create Audio CD")
+        self.btn = QPushButton("Burn Audio CD")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -280,7 +280,59 @@ class AudioCDTab(BaseTab):
             QMessageBox.information(self, "CD-Text", f"Generated {len(self.track_titles)} track titles.")
 
     def _refresh(self, files: List[str]):
-        self.gauge.update_size(compute_total_size(files))
+        # Audio CDs are limited by playback time, not bytes. Compute total
+        # duration with ffprobe in a background thread so dropping in a full
+        # album does not freeze the UI. Fall back to a rough estimate if ffprobe
+        # is unavailable.
+        #
+        # IMPORTANT: adding files fires this repeatedly. Each run starts a
+        # QThread, and we MUST keep a reference to every running thread until it
+        # finishes; otherwise Python garbage-collects a still-running QThread and
+        # the app crashes hard with no error. We keep a set of live threads and
+        # drop each one only when it has finished.
+        ffprobe = self.tools.find("ffprobe")
+        file_list = list(files)
+        if not file_list:
+            self.gauge.update_duration(0.0)
+            return
+
+        if not hasattr(self, "_dur_threads"):
+            self._dur_threads = set()
+
+        class DurThread(QThread):
+            done = pyqtSignal(float)
+
+            def __init__(self, paths, probe):
+                super().__init__()
+                self.paths = paths
+                self.probe = probe
+
+            def run(self):
+                try:
+                    secs = compute_total_duration(self.paths, self.probe)
+                except Exception:
+                    secs = 0.0
+                self.done.emit(secs)
+
+        snapshot = file_list
+        thread = DurThread(file_list, ffprobe)
+
+        def on_done(secs, th=thread):
+            try:
+                if secs and secs > 0:
+                    self.gauge.update_duration(secs)
+                else:
+                    est_seconds = compute_total_size(snapshot) / (10 * 1024 * 1024) * 60.0
+                    self.gauge.update_duration(est_seconds)
+            finally:
+                # Now that it has finished, stop tracking it. Do this after the
+                # thread has fully finished to avoid destroying a running thread.
+                self._dur_threads.discard(th)
+
+        thread.done.connect(on_done)
+        thread.finished.connect(lambda th=thread: self._dur_threads.discard(th))
+        self._dur_threads.add(thread)
+        thread.start()
 
     def _add(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Select Audio Files", "", "Audio (*.mp3 *.wav *.flac *.ogg *.m4a *.aac)")
@@ -300,10 +352,19 @@ class AudioCDTab(BaseTab):
         if self.track_titles and len(self.track_titles) != cnt:
             QMessageBox.warning(self, "CD-Text", "Track titles count does not match number of files.")
             return
+        # Warn if total playback time exceeds the disc (audio CDs hold ~80 min).
+        if self.gauge.current_seconds > self.gauge.max_minutes * 60.0:
+            r = QMessageBox.question(
+                self, "Over Capacity",
+                f"Total playback time is {int(self.gauge.current_seconds // 60)} min, which "
+                f"exceeds the {int(self.gauge.max_minutes)}-minute audio CD limit.\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                return
         temp_dir = Path(self.cfg.settings["temp_dir"])
-        needed = max(1, self.gauge.current_size)
+        # Temp space for decoding: CD audio is ~10 MB/min, so size by duration.
+        needed = max(1, int((self.gauge.current_seconds / 60.0) * 10 * 1024 * 1024))
         free = disk_free_bytes(temp_dir)
-        # Audio conversion slack ~1.5x
         if free < needed * 1.5:
             r = QMessageBox.question(self, "Low Temp Space",
                                      "Audio conversion may need extra temp space.\nContinue?",
@@ -325,7 +386,7 @@ class AudioCDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
 
 
 class VideoDVDTab(BaseTab):
@@ -356,7 +417,7 @@ class VideoDVDTab(BaseTab):
         self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
         lay.addWidget(self.chk_blank)
         lay.addWidget(self.chk_eject)
-        self.btn = QPushButton("Queue Job: Create Video DVD")
+        self.btn = QPushButton("Burn Video DVD")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -421,7 +482,7 @@ class VideoDVDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
 
 
 class VideoBDTab(BaseTab):
@@ -452,7 +513,7 @@ class VideoBDTab(BaseTab):
         self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
         lay.addWidget(self.chk_blank)
         lay.addWidget(self.chk_eject)
-        self.btn = QPushButton("Queue Job: Create Blu-ray")
+        self.btn = QPushButton("Burn Blu-ray")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -516,7 +577,7 @@ class VideoBDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
 
 
 class RipCDTab(BaseTab):
@@ -551,7 +612,7 @@ class RipCDTab(BaseTab):
         self.btn_mb = QPushButton("Lookup Metadata (MusicBrainz)")
         self.btn_mb.clicked.connect(self._lookup_mb)
         lay.addWidget(self.btn_mb)
-        self.btn = QPushButton("Queue Job: Rip CD")
+        self.btn = QPushButton("Start Ripping CD")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -635,4 +696,4 @@ class RipCDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")

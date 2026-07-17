@@ -98,6 +98,10 @@ class JobQueueService(QObject):
         job.status = "RUNNING"
         job.progress = 0
         self._log_lines = []
+        self._live_log_write(
+            f"\n===== JOB START {job.id} type={job.job_type.value} "
+            f"device={job.device} at {datetime.now().isoformat(timespec='seconds')} ====="
+        )
         self._worker = BurnWorker(job, self.tools, simulate_if_missing=self.settings.get("simulate_when_missing_tools", True), wsl=self.wsl)
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
@@ -189,6 +193,7 @@ class JobQueueService(QObject):
     def _status(self, job_id: str, s: str):
         if self._current and self._current.id == job_id:
             self._current.status = s
+            self._live_log_write(f"[{job_id}] STATUS: {s}")
             self.sig_status_update.emit(job_id, s, self._current.progress)
 
     def _progress(self, job_id: str, p: int):
@@ -196,6 +201,31 @@ class JobQueueService(QObject):
             self._current.progress = max(0, min(100, p))
             self.sig_status_update.emit(job_id, self._current.status, self._current.progress)
 
+    def _live_log_path(self):
+        """A log file NEXT TO THE EXE (readable location), written live so even
+        a job that hangs and never finalizes still leaves a trail up to the
+        freeze point. On a onefile build ~/.pyburn_logs may not be writable, so
+        this is the reliable diagnostic log."""
+        try:
+            import sys
+            if getattr(sys, "frozen", False):
+                base = Path(sys.executable).parent
+            else:
+                base = Path.cwd()
+            return base / "pyburn_job_live.log"
+        except Exception:
+            return None
+
+    def _live_log_write(self, text: str):
+        try:
+            p = self._live_log_path()
+            if p is not None:
+                with open(p, "a", encoding="utf-8") as f:
+                    f.write(text + "\n")
+        except Exception:
+            pass
+
     def _log(self, job_id: str, line: str):
         self._log_lines.append(line)
+        self._live_log_write(f"[{job_id}] LOG: {line}")
         self.sig_log_line.emit(job_id, line)

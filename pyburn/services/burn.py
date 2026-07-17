@@ -124,19 +124,51 @@ class BurnWorker(QObject):
     def _run_imapi2(self):
         from .imapi2_backend import IMAPI2Backend
         o = self.job.options
-        self._backend = IMAPI2Backend()
-        if self.job.job_type == JobType.DATA:
-            self._backend.burn_data(self.job.files, self.job.device, o.temp_dir, o.volume_label,
-                                    self.sig_status.emit, self.sig_progress.emit, self.sig_log.emit,
-                                    auto_blank=o.auto_blank, eject_after=o.eject_after)
-            self.sig_finished.emit(True, "Data disc burned successfully (IMAPI2)")
-        elif self.job.job_type == JobType.AUDIO:
-            wavs = self._decode_audio_to_wav(self.job.files, o.temp_dir)
-            self._backend.burn_audio(wavs, self.job.device, self.sig_status.emit,
-                                     self.sig_progress.emit, self.sig_log.emit, eject_after=o.eject_after)
-            self.sig_finished.emit(True, "Audio CD created successfully (IMAPI2)")
-        else:
-            self.sig_finished.emit(False, f"IMAPI2 does not handle {self.job.job_type.value}")
+        # CRITICAL: this runs on a Qt worker thread. IMAPI2 (COM) must have a COM
+        # apartment on this thread. Plain CoInitialize() gives a Single-Threaded
+        # Apartment (STA), and IMAPI2's disc-master enumeration deadlocks in an
+        # STA that has no Windows message pump (a worker thread has none): the
+        # first enumeration call blocks forever. Initialize a MULTI-THREADED
+        # apartment (MTA) instead, which does not require a message pump.
+        _com_ready = False
+        try:
+            import comtypes
+            # COINIT_MULTITHREADED = 0x0. CoInitializeEx(None, COINIT_MULTITHREADED).
+            try:
+                comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+            except Exception:
+                # Some comtypes versions: fall back to ctypes directly.
+                import ctypes
+                ctypes.windll.ole32.CoInitializeEx(None, 0x0)
+            _com_ready = True
+            self.sig_log.emit("COM initialized (MTA) on burn worker thread")
+        except Exception as e:
+            self.sig_log.emit(f"COM init (MTA) warning: {e}")
+        try:
+            self.sig_log.emit("Creating IMAPI2 backend...")
+            self._backend = IMAPI2Backend()
+            if self.job.job_type == JobType.DATA:
+                self.sig_log.emit("Dispatching to burn_data (IMAPI2)...")
+                self._backend.burn_data(self.job.files, self.job.device, o.temp_dir, o.volume_label,
+                                        self.sig_status.emit, self.sig_progress.emit, self.sig_log.emit,
+                                        auto_blank=o.auto_blank, eject_after=o.eject_after)
+                self.sig_finished.emit(True, "Data disc burned successfully (IMAPI2)")
+            elif self.job.job_type == JobType.AUDIO:
+                self.sig_log.emit("Decoding audio to WAV...")
+                wavs = self._decode_audio_to_wav(self.job.files, o.temp_dir)
+                self.sig_log.emit(f"Decoded {len(wavs)} tracks; dispatching to burn_audio (IMAPI2)...")
+                self._backend.burn_audio(wavs, self.job.device, self.sig_status.emit,
+                                         self.sig_progress.emit, self.sig_log.emit, eject_after=o.eject_after)
+                self.sig_finished.emit(True, "Audio CD created successfully (IMAPI2)")
+            else:
+                self.sig_finished.emit(False, f"IMAPI2 does not handle {self.job.job_type.value}")
+        finally:
+            if _com_ready:
+                try:
+                    import comtypes
+                    comtypes.CoUninitialize()
+                except Exception:
+                    pass
 
     def _decode_audio_to_wav(self, files, temp_dir: Path):
         # IMAPI2 audio wants 44100/16/stereo WAV. Use native ffmpeg if present,
@@ -151,8 +183,16 @@ class BurnWorker(QObject):
             if ffmpeg:
                 import subprocess
                 self.sig_status.emit(f"Decoding track {idx}/{len(files)} (ffmpeg)...")
-                subprocess.run([ffmpeg, "-y", "-i", str(src), "-ar", "44100", "-ac", "2",
-                                "-sample_fmt", "s16", str(target)], capture_output=True, text=True)
+                # -map_metadata -1 drops the source MP3 tags so ffmpeg does not
+                # write a LIST/INFO chunk into the WAV. -rf64 never and an
+                # explicit pcm_s16le codec keep it a plain 44100/16/stereo PCM
+                # WAV, which is what the audio CD path expects. -bitexact avoids
+                # ffmpeg writing its own encoder-info metadata chunk.
+                subprocess.run([ffmpeg, "-y", "-i", str(src),
+                                "-map_metadata", "-1", "-bitexact",
+                                "-ar", "44100", "-ac", "2",
+                                "-c:a", "pcm_s16le", "-sample_fmt", "s16",
+                                str(target)], capture_output=True, text=True)
                 wavs.append(target)
             else:
                 # No encoder: only usable if the input already is WAV.
@@ -180,19 +220,36 @@ class BurnWorker(QObject):
     def _run_wsl_author(self):
         from .wsl_backend import WSLAuthorBackend
         o = self.job.options
-        self._backend = WSLAuthorBackend(self.resolver.wsl)
-        if self.job.job_type == JobType.VIDEO_DVD:
-            self._backend.burn_video_dvd(self.job.files, self.job.device, self.sig_status.emit,
-                                        self.sig_progress.emit, self.sig_log.emit,
-                                        auto_blank=o.auto_blank, eject_after=o.eject_after)
-            self.sig_finished.emit(True, "Video DVD created successfully (WSL2 author + IMAPI2 burn)")
-        elif self.job.job_type == JobType.VIDEO_BD:
-            self._backend.burn_video_bd(self.job.files, self.job.device, self.sig_status.emit,
-                                       self.sig_progress.emit, self.sig_log.emit,
-                                       auto_blank=o.auto_blank, eject_after=o.eject_after)
-            self.sig_finished.emit(True, "Blu-ray created successfully (WSL2 author + IMAPI2 burn)")
-        else:
-            self.sig_finished.emit(False, f"WSL path does not handle {self.job.job_type.value}")
+        # The burn half of this path uses IMAPI2 (COM) on this worker thread, so
+        # the COM apartment must be initialized here too (see _run_imapi2).
+        _com_ready = False
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+            _com_ready = True
+        except Exception as e:
+            self.sig_log.emit(f"COM init warning: {e}")
+        try:
+            self._backend = WSLAuthorBackend(self.resolver.wsl)
+            if self.job.job_type == JobType.VIDEO_DVD:
+                self._backend.burn_video_dvd(self.job.files, self.job.device, self.sig_status.emit,
+                                            self.sig_progress.emit, self.sig_log.emit,
+                                            auto_blank=o.auto_blank, eject_after=o.eject_after)
+                self.sig_finished.emit(True, "Video DVD created successfully (WSL2 author + IMAPI2 burn)")
+            elif self.job.job_type == JobType.VIDEO_BD:
+                self._backend.burn_video_bd(self.job.files, self.job.device, self.sig_status.emit,
+                                           self.sig_progress.emit, self.sig_log.emit,
+                                           auto_blank=o.auto_blank, eject_after=o.eject_after)
+                self.sig_finished.emit(True, "Blu-ray created successfully (WSL2 author + IMAPI2 burn)")
+            else:
+                self.sig_finished.emit(False, f"WSL path does not handle {self.job.job_type.value}")
+        finally:
+            if _com_ready:
+                try:
+                    import comtypes
+                    comtypes.CoUninitialize()
+                except Exception:
+                    pass
 
     def cancel(self):
         if self._backend is not None and hasattr(self._backend, "cancel"):

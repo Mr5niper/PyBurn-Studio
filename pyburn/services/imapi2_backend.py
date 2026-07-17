@@ -70,42 +70,64 @@ class IMAPI2Backend:
         import comtypes.client
         return comtypes.client.CreateObject(progid)
 
-    def _recorder_for(self, device: str):
+    def _recorder_for(self, device: str, on_log: Optional[OnLog] = None):
         """Return an MsftDiscRecorder2 bound to the drive.
 
         `device` on Windows is a drive letter like 'E:' or an IMAPI unique id.
         We map a drive letter to its IMAPI recorder by matching volume paths.
         """
+        def log(m):
+            if on_log:
+                on_log(m)
         import comtypes.client
+        log("_recorder_for: creating MsftDiscMaster2...")
         master = self._new("IMAPI2.MsftDiscMaster2")
-        recorder = self._new("IMAPI2.MsftDiscRecorder2")
         want = (device or "").rstrip("\\/").upper()
-        # Try to match the requested drive letter against each recorder's
-        # VolumePathNames; if no match, use the first recorder.
         chosen_id = None
+        matched_recorder = None
         try:
             count = master.Count
+            log(f"_recorder_for: {count} IMAPI device(s) present")
             for i in range(count):
                 uid = master.Item(i)
+                # Use a FRESH recorder per device. Reusing one recorder object
+                # and calling InitializeDiscRecorder on it more than once can
+                # block, which is exactly what hung the burn: the match loop
+                # left the recorder initialized to H:, then a second
+                # InitializeDiscRecorder on the same object at the end froze.
+                probe = self._new("IMAPI2.MsftDiscRecorder2")
                 try:
-                    recorder.InitializeDiscRecorder(uid)
-                    vols = recorder.VolumePathNames
-                    for v in vols:
-                        if str(v).rstrip("\\/").upper() == want:
-                            chosen_id = uid
-                            break
-                except Exception:
+                    log(f"_recorder_for: init recorder for device index {i}...")
+                    probe.InitializeDiscRecorder(uid)
+                    vols = probe.VolumePathNames
+                    vol_list = [str(v).rstrip("\\/").upper() for v in vols]
+                    log(f"_recorder_for: device {i} volumes={vol_list} (want {want})")
+                    if want in vol_list:
+                        chosen_id = uid
+                        matched_recorder = probe  # already initialized to it
+                        break
+                    if i == 0:
+                        # Remember the first as a fallback recorder.
+                        chosen_id = chosen_id or None
+                        first_recorder = probe
+                except Exception as e:
+                    log(f"_recorder_for: device {i} probe failed: {e}")
                     continue
-                if chosen_id:
-                    break
-            if chosen_id is None and count > 0:
-                chosen_id = master.Item(0)
-        except Exception:
-            pass
-        if chosen_id is None:
+            if matched_recorder is None and count > 0:
+                # No exact volume match: fall back to a fresh recorder on the
+                # first device, initialized exactly once.
+                log("_recorder_for: no volume match; using first device")
+                matched_recorder = self._new("IMAPI2.MsftDiscRecorder2")
+                matched_recorder.InitializeDiscRecorder(master.Item(0))
+        except Exception as e:
+            log(f"_recorder_for: enumeration error: {e}")
+        if matched_recorder is None:
             raise RuntimeError("No optical recorder found via IMAPI2")
-        recorder.InitializeDiscRecorder(chosen_id)
-        return recorder
+        # IMPORTANT: matched_recorder is ALREADY initialized to the target drive.
+        # Do NOT call InitializeDiscRecorder again (that second call is what
+        # hung). Return it as-is.
+        log("_recorder_for: recorder ready (reusing initialized recorder)")
+        return matched_recorder
 
     # -- media info / blank / eject ------------------------------------------
     def get_media_info(self, device: str) -> dict:
@@ -257,31 +279,77 @@ class IMAPI2Backend:
     def burn_audio(self, wav_files: List[Path], device: str,
                    on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
                    eject_after: bool = True) -> None:
-        """Burn Red Book audio tracks from 44100/16-bit stereo WAV files."""
-        recorder = self._recorder_for(device)
-        audio = self._new("IMAPI2.MsftDiscFormat2RawCD")
-        # RawCD is the reliable audio path; some systems expose MsftDiscFormat2TrackAtOnce.
+        """Burn Red Book audio tracks from 44100/16-bit stereo WAV files.
+
+        Uses the TrackAtOnce interface. PrepareMedia() is called EXACTLY ONCE
+        before adding any tracks, then every track is added, then ReleaseMedia()
+        once at the end. (An earlier version called PrepareMedia() inside the
+        per-track loop, which throws a COM error after the first track and
+        aborted the burn.)
+        """
+        on_status("Connecting to burner (IMAPI2)...")
+        on_log(f"burn_audio: start, device={device}, tracks={len(wav_files)}")
+        on_log("burn_audio: resolving recorder (enumerating IMAPI2 drives)...")
+        recorder = self._recorder_for(device, on_log=on_log)
+        on_log("burn_audio: recorder resolved OK")
         try:
+            on_log("burn_audio: creating TrackAtOnce formatter...")
             tao = self._new("IMAPI2.MsftDiscFormat2TrackAtOnce")
-        except Exception:
-            tao = None
-        on_status("Burning audio CD (IMAPI2)...")
-        if tao is not None:
-            tao.Recorder = recorder
-            tao.ClientName = "PyBurn Studio"
-            try:
-                self._wire_progress(tao, on_progress, audio=True)
-            except Exception:
-                pass
-            n = max(1, len(wav_files))
-            for i, wav in enumerate(wav_files, start=1):
-                istream = self._audio_istream_for_wav(wav)
-                tao.PrepareMedia()
-                tao.AddAudioTrack(istream)
-                on_progress(int((i / n) * 100))
-            tao.ReleaseMedia()
-        else:
+        except Exception as e:
+            raise RuntimeError(f"IMAPI2 TrackAtOnce interface unavailable: {e}")
+        if tao is None:
             raise RuntimeError("IMAPI2 TrackAtOnce audio interface unavailable on this system")
+
+        on_log("burn_audio: assigning recorder to formatter...")
+        tao.Recorder = recorder
+        tao.ClientName = "PyBurn Studio"
+        try:
+            self._wire_progress(tao, on_progress, audio=True)
+        except Exception:
+            pass
+
+        n = max(1, len(wav_files))
+        on_status("Preparing disc for audio burn (IMAPI2)...")
+        on_log("burn_audio: calling PrepareMedia()...")
+        tao.PrepareMedia()
+        on_log("burn_audio: PrepareMedia() returned; adding tracks...")
+        added = 0
+        burn_error = None
+        try:
+            for i, wav in enumerate(wav_files, start=1):
+                on_status(f"Writing audio track {i}/{n} (IMAPI2)...")
+                on_log(f"burn_audio: track {i}/{n}: opening raw PCM stream for {wav}")
+                try:
+                    istream = self._audio_istream_for_wav(wav)
+                except Exception as e:
+                    # Surface the REAL reason instead of silently releasing.
+                    on_log(f"burn_audio: track {i}/{n}: FAILED opening stream: {e!r}")
+                    raise
+                on_log(f"burn_audio: track {i}/{n}: AddAudioTrack()...")
+                try:
+                    tao.AddAudioTrack(istream)
+                except Exception as e:
+                    on_log(f"burn_audio: track {i}/{n}: FAILED AddAudioTrack: {e!r}")
+                    raise
+                added += 1
+                on_log(f"burn_audio: track {i}/{n}: added OK")
+                on_progress(int((i / n) * 100))
+        except Exception as e:
+            burn_error = e
+        finally:
+            # Always release the media, even if a track write raised, so the
+            # drive is left in a sane state.
+            try:
+                on_log("burn_audio: calling ReleaseMedia()...")
+                tao.ReleaseMedia()
+                on_log("burn_audio: ReleaseMedia() returned")
+            except Exception as e:
+                on_log(f"IMAPI2 ReleaseMedia warning: {e}")
+        if burn_error is not None:
+            # Do NOT report success when nothing burned.
+            raise RuntimeError(f"Audio burn failed after {added}/{n} tracks: {burn_error}")
+        if added == 0:
+            raise RuntimeError("Audio burn added no tracks; nothing was written.")
         on_progress(100)
         on_status("Audio CD created successfully (IMAPI2).")
         if eject_after:
@@ -291,14 +359,40 @@ class IMAPI2Backend:
                 pass
 
     # -- low level: IStream over files ---------------------------------------
+    def _get_istream_type(self):
+        """Return the comtypes IStream interface class.
+
+        In a frozen onefile build, IStream is not a plain importable symbol; it
+        lives in a generated module. comtypes generates it on demand from
+        portabledeviceapi.dll via GetModule. The build bundles comtypes fully
+        (--collect-all comtypes) so this generation works at runtime, matching
+        how the sibling audioctl onefile handles comtypes. We cache the result.
+        """
+        if getattr(self, "_istream_type", None) is not None:
+            return self._istream_type
+        import comtypes.client
+        # Generate/import the interface. Try the standard source first.
+        last_err = None
+        for gen_arg, modname, attr in (
+            ("portabledeviceapi.dll", "comtypes.gen.PortableDeviceApiLib", "IStream"),
+        ):
+            try:
+                comtypes.client.GetModule(gen_arg)
+                mod = __import__(modname, fromlist=[attr])
+                self._istream_type = getattr(mod, attr)
+                return self._istream_type
+            except Exception as e:
+                last_err = e
+        raise RuntimeError(f"Could not obtain IStream interface via comtypes: {last_err}")
+
     def _istream_for_file(self, path: Path):
         """Create an IStream over a file using SHCreateStreamOnFileEx."""
         import ctypes
         from ctypes import wintypes
-        import comtypes
+        IStream = self._get_istream_type()
         STGM_READ = 0x00000000
         shlwapi = ctypes.windll.shlwapi
-        ppstm = ctypes.POINTER(comtypes.IUnknown)()
+        ppstm = ctypes.POINTER(IStream)()
         # SHCreateStreamOnFileEx(pszFile, grfMode, dwAttributes, fCreate, pstmTemplate, ppstm)
         hr = shlwapi.SHCreateStreamOnFileEx(
             ctypes.c_wchar_p(str(path)),
@@ -310,13 +404,53 @@ class IMAPI2Backend:
         )
         if hr != 0:
             raise OSError(f"SHCreateStreamOnFileEx failed: 0x{hr & 0xffffffff:08x}")
-        from comtypes.stream import IStream  # type: ignore
-        return ppstm.QueryInterface(IStream)
+        return ppstm
 
     def _audio_istream_for_wav(self, wav: Path):
-        # Audio tracks want raw 44100/16/stereo PCM; IMAPI accepts a WAV IStream
-        # through the same file stream mechanism.
-        return self._istream_for_file(wav)
+        # IMAPI2 AddAudioTrack requires RAW 16-bit little-endian stereo 44100 Hz
+        # PCM with NO WAV/RIFF header, AND the total byte length MUST be a whole
+        # number of CD audio sectors (2352 bytes each). ffmpeg output is almost
+        # never sector-aligned, and an unaligned stream makes AddAudioTrack fail
+        # with "The provided audio stream is not valid." So: parse the WAV, take
+        # the data chunk, pad the PCM up to the next 2352-byte boundary with
+        # silence (zeros), and stream that.
+        CD_SECTOR = 2352
+        wav = Path(wav)
+        pcm_path = wav.with_suffix(".pcm")
+        try:
+            with open(wav, "rb") as f:
+                riff = f.read(12)
+                if riff[0:4] != b"RIFF" or riff[8:12] != b"WAVE":
+                    # Not a WAV we recognize; stream as-is and hope for the best.
+                    return self._istream_for_file(wav)
+                data_offset = None
+                data_size = None
+                while True:
+                    hdr = f.read(8)
+                    if len(hdr) < 8:
+                        break
+                    cid = hdr[0:4]
+                    csize = int.from_bytes(hdr[4:8], "little")
+                    if cid == b"data":
+                        data_offset = f.tell()
+                        data_size = csize
+                        break
+                    f.seek(csize, 1)  # skip this chunk's body
+                if data_offset is None:
+                    return self._istream_for_file(wav)
+                f.seek(data_offset)
+                pcm = f.read(data_size)
+            # Pad to a whole number of CD audio sectors (2352 bytes) with
+            # silence, so IMAPI2 accepts the stream.
+            remainder = len(pcm) % CD_SECTOR
+            if remainder:
+                pcm = pcm + (b"\x00" * (CD_SECTOR - remainder))
+            with open(pcm_path, "wb") as out:
+                out.write(pcm)
+            return self._istream_for_file(pcm_path)
+        except Exception:
+            # On any parsing trouble, fall back to the raw file stream.
+            return self._istream_for_file(wav)
 
     def _wire_progress(self, formatter, on_progress: OnProgress, audio: bool = False):
         """Best-effort connect an IMAPI2 progress event sink.

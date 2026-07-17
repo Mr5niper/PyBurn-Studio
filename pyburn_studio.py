@@ -1,6 +1,20 @@
 from __future__ import annotations
 import sys
 import argparse
+
+# Frozen-build COM stability (mirrors the sibling audioctl app's compat shim).
+# comtypes uses internal _post_coinit modules to finalize COM types and provide
+# correct cleanup (__del__ -> Release()). In a PyInstaller onefile build these
+# can be missed by the bundler or first imported during interpreter shutdown,
+# which causes noisy or hard COM-cleanup crashes. Importing them here at startup
+# makes them visible to the bundler and avoids the late-import timing. Guarded so
+# non-Windows / source runs are unaffected.
+try:
+    import comtypes._post_coinit  # noqa: F401
+    import comtypes._post_coinit.unknwn  # noqa: F401
+except Exception:
+    pass
+
 from PyQt6.QtWidgets import QApplication, QMessageBox
 from pyburn.core.config import Config
 from pyburn.core.tools import ToolFinder
