@@ -715,28 +715,33 @@ class RipCDTab(BaseTab):
         self._mb_thread = th  # hold ref
 
     def _start(self):
-        # Require cdparanoia for real ripping
-        missing = self.tools.missing(["cdparanoia"])
-        if missing:
-            if self.cfg.settings.get("simulate_when_missing_tools", True):
-                r = QMessageBox.question(
-                    self,
-                    "Required Tool Missing",
-                    "The required tool 'cdparanoia' is not installed.\n\n"
-                    "Do you want to run a SIMULATED rip (for testing) instead?\n\n"
-                    "Choose No to cancel so you can install cdparanoia first.",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                if r != QMessageBox.StandardButton.Yes:
+        # Ripping route depends on platform. On Windows the native IOCTL ripper
+        # reads CD audio with NO external tool (cdparanoia is a Unix tool with no
+        # Windows build), so requiring it here was wrong and blocked Windows rips.
+        # Only gate on cdparanoia for the CLI path (Linux/macOS).
+        from ..services.platform_caps import is_windows
+        if not is_windows():
+            missing = self.tools.missing(["cdparanoia"])
+            if missing:
+                if self.cfg.settings.get("simulate_when_missing_tools", True):
+                    r = QMessageBox.question(
+                        self,
+                        "Required Tool Missing",
+                        "The required tool 'cdparanoia' is not installed.\n\n"
+                        "Do you want to run a SIMULATED rip (for testing) instead?\n\n"
+                        "Choose No to cancel so you can install cdparanoia first.",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if r != QMessageBox.StandardButton.Yes:
+                        return
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Required Tool Missing",
+                        "The required tool 'cdparanoia' is not installed.\n"
+                        "Install it and try again."
+                    )
                     return
-            else:
-                QMessageBox.warning(
-                    self,
-                    "Required Tool Missing",
-                    "The required tool 'cdparanoia' is not installed.\n"
-                    "Install it and try again."
-                )
-                return
         out = Path(self.ed_out.text())
         job = Job(
             job_type=JobType.RIP,
