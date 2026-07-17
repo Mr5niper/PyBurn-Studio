@@ -293,6 +293,32 @@ class IMAPI2Backend:
             self._wire_progress(data, on_progress)
         except Exception:
             pass
+        # Diagnostics + correctness around the physical write:
+        # - Log the PHYSICAL media type and whether this formatter says the media
+        #   is supported. CurrentMediaType came back None, so confirm what the
+        #   formatter actually sees.
+        # - Acquire exclusive access to the recorder for the duration of the
+        #   write. Without it, the Windows shell / autoplay / indexing can hold
+        #   the drive and the physical write fails with an unrecoverable drive
+        #   error even though the image is valid. The audio TrackAtOnce path
+        #   happened to work without this, but data writing is stricter.
+        try:
+            phys = int(data.CurrentPhysicalMediaType)
+            on_log(f"burn_data: CurrentPhysicalMediaType = {phys}")
+        except Exception as e:
+            on_log(f"burn_data: physical media type warning: {e}")
+        try:
+            supported = bool(data.IsCurrentMediaSupported(recorder))
+            on_log(f"burn_data: IsCurrentMediaSupported = {supported}")
+        except Exception as e:
+            on_log(f"burn_data: media support query warning: {e}")
+        acquired = False
+        try:
+            recorder.AcquireExclusiveAccess(True, "PyBurn Studio")
+            acquired = True
+            on_log("burn_data: acquired exclusive access to recorder")
+        except Exception as e:
+            on_log(f"burn_data: AcquireExclusiveAccess warning (continuing): {e}")
         on_status("Burning data disc (IMAPI2)...")
         on_log("burn_data: calling Write(image_stream)...")
         burn_error = None
@@ -305,6 +331,12 @@ class IMAPI2Backend:
             burn_error = e
             on_log(f"burn_data: FAILED Write: {e!r}")
         finally:
+            if acquired:
+                try:
+                    recorder.ReleaseExclusiveAccess()
+                    on_log("burn_data: released exclusive access")
+                except Exception:
+                    pass
             if eject_after:
                 try:
                     on_log("burn_data: ejecting media...")
