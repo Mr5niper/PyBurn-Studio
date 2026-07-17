@@ -124,29 +124,39 @@ class BurnWorker(QObject):
     def _run_imapi2(self):
         from .imapi2_backend import IMAPI2Backend
         o = self.job.options
-        # CRITICAL: this method runs on a Qt worker thread, not the GUI thread.
-        # COM objects (IMAPI2 via comtypes) can only be created on a thread that
-        # has initialized a COM apartment. The GUI thread gets one from Qt, but
-        # this worker thread does not, so without CoInitialize here the first
-        # CreateObject call hangs forever, which looked like "decode finishes,
-        # then it just sits there". Initialize COM for this thread, and
-        # uninitialize when done.
+        # CRITICAL: this runs on a Qt worker thread. IMAPI2 (COM) must have a COM
+        # apartment on this thread. Plain CoInitialize() gives a Single-Threaded
+        # Apartment (STA), and IMAPI2's disc-master enumeration deadlocks in an
+        # STA that has no Windows message pump (a worker thread has none): the
+        # first enumeration call blocks forever. Initialize a MULTI-THREADED
+        # apartment (MTA) instead, which does not require a message pump.
         _com_ready = False
         try:
             import comtypes
-            comtypes.CoInitialize()
+            # COINIT_MULTITHREADED = 0x0. CoInitializeEx(None, COINIT_MULTITHREADED).
+            try:
+                comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+            except Exception:
+                # Some comtypes versions: fall back to ctypes directly.
+                import ctypes
+                ctypes.windll.ole32.CoInitializeEx(None, 0x0)
             _com_ready = True
+            self.sig_log.emit("COM initialized (MTA) on burn worker thread")
         except Exception as e:
-            self.sig_log.emit(f"COM init warning: {e}")
+            self.sig_log.emit(f"COM init (MTA) warning: {e}")
         try:
+            self.sig_log.emit("Creating IMAPI2 backend...")
             self._backend = IMAPI2Backend()
             if self.job.job_type == JobType.DATA:
+                self.sig_log.emit("Dispatching to burn_data (IMAPI2)...")
                 self._backend.burn_data(self.job.files, self.job.device, o.temp_dir, o.volume_label,
                                         self.sig_status.emit, self.sig_progress.emit, self.sig_log.emit,
                                         auto_blank=o.auto_blank, eject_after=o.eject_after)
                 self.sig_finished.emit(True, "Data disc burned successfully (IMAPI2)")
             elif self.job.job_type == JobType.AUDIO:
+                self.sig_log.emit("Decoding audio to WAV...")
                 wavs = self._decode_audio_to_wav(self.job.files, o.temp_dir)
+                self.sig_log.emit(f"Decoded {len(wavs)} tracks; dispatching to burn_audio (IMAPI2)...")
                 self._backend.burn_audio(wavs, self.job.device, self.sig_status.emit,
                                          self.sig_progress.emit, self.sig_log.emit, eject_after=o.eject_after)
                 self.sig_finished.emit(True, "Audio CD created successfully (IMAPI2)")
@@ -173,8 +183,16 @@ class BurnWorker(QObject):
             if ffmpeg:
                 import subprocess
                 self.sig_status.emit(f"Decoding track {idx}/{len(files)} (ffmpeg)...")
-                subprocess.run([ffmpeg, "-y", "-i", str(src), "-ar", "44100", "-ac", "2",
-                                "-sample_fmt", "s16", str(target)], capture_output=True, text=True)
+                # -map_metadata -1 drops the source MP3 tags so ffmpeg does not
+                # write a LIST/INFO chunk into the WAV. -rf64 never and an
+                # explicit pcm_s16le codec keep it a plain 44100/16/stereo PCM
+                # WAV, which is what the audio CD path expects. -bitexact avoids
+                # ffmpeg writing its own encoder-info metadata chunk.
+                subprocess.run([ffmpeg, "-y", "-i", str(src),
+                                "-map_metadata", "-1", "-bitexact",
+                                "-ar", "44100", "-ac", "2",
+                                "-c:a", "pcm_s16le", "-sample_fmt", "s16",
+                                str(target)], capture_output=True, text=True)
                 wavs.append(target)
             else:
                 # No encoder: only usable if the input already is WAV.
