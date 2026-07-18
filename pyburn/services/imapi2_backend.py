@@ -147,6 +147,11 @@ class IMAPI2Backend:
                     info["type"] = "DVD"
                 elif mt in (14, 15, 16, 17, 18, 19):
                     info["type"] = "BD"
+                # Rewritable physical media types (IMAPI_MEDIA_PHYSICAL_TYPE):
+                # CDRW=3, DVDRAM=4, DVDPLUSRW=6, DVDPLUSRW_DL=8, DVDDASHRW=10,
+                # DVDDASHRW_DL=12, BDRE=17. Everything else (CDR=2, DVDR, BDR,
+                # etc.) is write-once and must NEVER be erased.
+                info["rewritable"] = mt in (3, 4, 6, 8, 10, 12, 17)
         except Exception:
             pass
         return info
@@ -156,12 +161,16 @@ class IMAPI2Backend:
             recorder = self._recorder_for(device)
             eraser = self._new("IMAPI2.MsftDiscFormat2Erase")
             eraser.Recorder = recorder
+            # ClientName is REQUIRED; without it EraseMedia throws
+            # "The client name is not valid."
+            eraser.ClientName = "PyBurn Studio"
             eraser.FullErase = False  # quick erase
             on_status("Erasing rewritable media (IMAPI2)...")
             eraser.EraseMedia()
+            on_log("IMAPI2 erase completed")
             return True
         except Exception as e:
-            on_log(f"IMAPI2 erase failed: {e}")
+            on_log(f"IMAPI2 erase failed: {e!r}")
             return False
 
     def eject(self, device: str) -> None:
@@ -216,17 +225,26 @@ class IMAPI2Backend:
 
     def burn_data(self, files: List[Path], device: str, temp_dir: Path, volume: str,
                   on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
-                  auto_blank: bool = True, eject_after: bool = True, speed="Auto") -> None:
+                  auto_blank: bool = True, eject_after: bool = True, speed="Auto",
+                  dummy: bool = False) -> None:
         """Build a data image from files/folders and burn it, all via IMAPI2."""
         on_log(f"burn_data: start, device={device}, items={len(files)}")
         on_log("burn_data: resolving recorder...")
         recorder = self._recorder_for(device, on_log=on_log)
         on_log("burn_data: recorder resolved OK")
         info = self.get_media_info(device)
-        on_log(f"burn_data: media info blank={info.get('blank')} rewritable={info.get('rewritable')}")
-        if auto_blank and info.get("blank") is False:
-            on_log("burn_data: media not blank, blanking...")
+        on_log(f"burn_data: media info blank={info.get('blank')} rewritable={info.get('rewritable')} type={info.get('type')}")
+        # Only erase REWRITABLE media that is not blank. MediaHeuristicallyBlank
+        # gives false negatives on blank CD-Rs, and CD-R/DVD-R/BD-R are
+        # write-once and cannot be erased at all. Erasing (or trying to) a
+        # write-once disc fails and then blocks the burn, so gate on rewritable.
+        if auto_blank and info.get("rewritable") is True and info.get("blank") is False:
+            on_log("burn_data: rewritable media not blank, erasing...")
             self.blank(device, on_status, on_log)
+        elif info.get("blank") is False and info.get("rewritable") is not True:
+            on_log("burn_data: media reports not-blank but is write-once (CD-R/DVD-R/BD-R); "
+                   "not erasing. If this is a used write-once disc the write may fail; "
+                   "otherwise MediaHeuristicallyBlank is a false negative and the write will proceed.")
         on_status("Building data image (IMAPI2)...")
         on_log("burn_data: creating MsftFileSystemImage...")
         fsi = self._new("IMAPI2FS.MsftFileSystemImage")
@@ -242,12 +260,28 @@ class IMAPI2Backend:
             fsi.ChooseImageDefaults(recorder)
         except Exception as e:
             on_log(f"burn_data: ChooseImageDefaults warning: {e}")
+        # Link the filesystem image to the recorder's multisession state BEFORE
+        # building it. Create a MsftDiscFormat2Data now, and hand its
+        # MultisessionInterfaces to the image so the image is laid out for the
+        # actual disc (starting sector, session import). Without this the image
+        # is built assuming a layout that need not match the disc, and the write
+        # opens a session then fails. For a blank disc this simply starts a new
+        # session at 0; for an appendable disc it imports prior content.
+        data = self._new("IMAPI2.MsftDiscFormat2Data")
+        data.Recorder = recorder
+        data.ClientName = "PyBurn Studio"
+        try:
+            ms = data.MultisessionInterfaces
+            fsi.MultisessionInterfaces = ms
+            on_log("burn_data: linked MultisessionInterfaces to the image")
+        except Exception as e:
+            # On some blank-media/driver combinations this property is null and
+            # cannot be assigned; that is fine for a fresh single-session burn.
+            on_log(f"burn_data: MultisessionInterfaces not set ({e!r}); single-session burn")
         try:
             fsi.VolumeName = (volume or "DATA_DISC")[:32]
         except Exception as e:
             on_log(f"burn_data: VolumeName warning: {e}")
-        # For a fresh single-session burn, import no previous session and mark
-        # the file-system types explicitly for broad readability.
         try:
             # FsiFileSystemISO9660 (1) | FsiFileSystemJoliet (2) | FsiFileSystemUDF (4) = 7
             fsi.FileSystemsToCreate = 7
@@ -263,15 +297,9 @@ class IMAPI2Backend:
             image_stream = result.ImageStream
         except Exception as e:
             raise RuntimeError(f"Failed to build the data image: {e!r}")
-        on_log("burn_data: creating MsftDiscFormat2Data...")
-        data = self._new("IMAPI2.MsftDiscFormat2Data")
-        data.Recorder = recorder
-        data.ClientName = "PyBurn Studio"
+        on_log("burn_data: data formatter ready (created before image for multisession link)")
         # Log what the drive/media supports for diagnostics, but let IMAPI2
-        # choose the actual write speed (its default). The earlier data-burn
-        # failure was a mis-sized image, not a speed problem, so there is no need
-        # to force a slow speed; forcing the slowest advertised speed only made
-        # burns needlessly slow.
+        # choose the actual write speed (its default).
         try:
             cur = getattr(data, "CurrentMediaType", None)
             on_log(f"burn_data: current media type = {cur}")
@@ -320,6 +348,15 @@ class IMAPI2Backend:
         except Exception as e:
             on_log(f"burn_data: AcquireExclusiveAccess warning (continuing): {e}")
         on_status("Burning data disc (IMAPI2)...")
+        if dummy:
+            try:
+                data.SimulateWrite = True
+                on_log("burn_data: DUMMY/TEST burn - SimulateWrite=True, laser off, disc NOT written")
+                on_status("Test burn (simulated, disc not written)...")
+            except Exception as e:
+                on_log(f"burn_data: SimulateWrite not available ({e!r}); cannot simulate, aborting to protect the disc")
+                raise RuntimeError("Dummy burn requested but this drive/driver does not support "
+                                   "IMAPI2 SimulateWrite; aborting so a disc is not consumed.")
         on_log("burn_data: calling Write(image_stream)...")
         burn_error = None
         try:

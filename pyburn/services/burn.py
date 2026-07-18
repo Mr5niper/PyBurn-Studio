@@ -151,7 +151,8 @@ class BurnWorker(QObject):
                 self.sig_log.emit("Dispatching to burn_data (IMAPI2)...")
                 self._backend.burn_data(self.job.files, self.job.device, o.temp_dir, o.volume_label,
                                         self.sig_status.emit, self.sig_progress.emit, self.sig_log.emit,
-                                        auto_blank=o.auto_blank, eject_after=o.eject_after, speed=o.speed)
+                                        auto_blank=o.auto_blank, eject_after=o.eject_after, speed=o.speed,
+                                        dummy=o.dummy)
                 self.sig_finished.emit(True, "Data disc burned successfully (IMAPI2)")
             elif self.job.job_type == JobType.AUDIO:
                 self.sig_log.emit("Decoding audio to WAV...")
