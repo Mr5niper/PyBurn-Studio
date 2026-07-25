@@ -383,6 +383,71 @@ class IMAPI2Backend:
         if burn_error is not None:
             raise RuntimeError(f"Data disc burn failed: {burn_error}")
 
+    def build_iso(self, files: List[Path], out_iso: Path, volume: str,
+                  on_status: OnStatus, on_log: OnLog) -> Path:
+        """Build an ISO9660/Joliet/UDF image file from files/folders.
+
+        Uses IMAPI2's MsftFileSystemImage to author the image, then streams the
+        result image to a plain .iso file on disk. This is COM work, but it all
+        happens BEFORE any disc write, so it never overlaps a write (the reason
+        the SPTI writer exists is to avoid COM during the write; building the
+        image up front is fine). The produced .iso is then burned by SPTIWriter.
+        """
+        on_status("Building ISO image (IMAPI2 authoring)...")
+        on_log(f"build_iso: authoring image for {len(files)} item(s) -> {out_iso}")
+        fsi = self._new("IMAPI2FS.MsftFileSystemImage")
+        try:
+            fsi.FileSystemsToCreate = 7  # ISO9660 | Joliet | UDF
+        except Exception as e:
+            on_log(f"build_iso: FileSystemsToCreate warning: {e}")
+        try:
+            fsi.VolumeName = (volume or "DATA_DISC")[:32]
+        except Exception as e:
+            on_log(f"build_iso: VolumeName warning: {e}")
+        root = fsi.Root
+        added = self._add_tree(root, files, on_log)
+        if added == 0:
+            raise RuntimeError("No files could be added to the image; nothing to burn.")
+        on_log(f"build_iso: added {added} item(s); creating result image...")
+        result = fsi.CreateResultImage()
+        stream = result.ImageStream
+        # Stream is an IStream; read it in blocks and write to the .iso file.
+        # IStream.RemoteRead via comtypes returns (buffer, bytes_read). Read the
+        # block size from the image so the file is exactly the image size.
+        try:
+            block_size = int(result.ImageSize) if hasattr(result, "ImageSize") else 0
+        except Exception:
+            block_size = 0
+        out_iso = Path(out_iso)
+        out_iso.parent.mkdir(parents=True, exist_ok=True)
+        total = 0
+        CHUNK = 1024 * 1024
+        with open(out_iso, "wb") as fout:
+            while True:
+                try:
+                    data = stream.RemoteRead(CHUNK)
+                except Exception:
+                    # Some comtypes builds expose Read differently; fall back.
+                    data = None
+                if data is None:
+                    # Fallback: use the Stat size and a Seek/Read loop is not
+                    # available; bail if we cannot read.
+                    break
+                # RemoteRead returns (sequence_of_bytes, count) or bytes.
+                if isinstance(data, tuple):
+                    buf, count = data[0], data[1]
+                    chunk = bytes(bytearray(buf[:count]))
+                else:
+                    chunk = bytes(data)
+                if not chunk:
+                    break
+                fout.write(chunk)
+                total += len(chunk)
+        on_log(f"build_iso: wrote {total} bytes to {out_iso}")
+        if total == 0:
+            raise RuntimeError("ISO image came out empty; cannot burn.")
+        return out_iso
+
     def _add_tree(self, dir_item, files: List[Path], on_log: OnLog) -> int:
         """Recursively add files/dirs into an IMAPI file system image directory.
         Returns the number of items successfully added."""

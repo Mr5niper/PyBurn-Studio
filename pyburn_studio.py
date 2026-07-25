@@ -116,10 +116,139 @@ def self_test():
     return 0
 
 
+def cli_burn_data(args):
+    """One-shot data burn in a DEDICATED process, with REAL per-sector progress.
+
+    Two-stage, and neither stage overlaps a COM call with a disc write:
+      1) Build an ISO image file from the selected files/folders using IMAPI2
+         authoring (MsftFileSystemImage). This is COM, but it finishes BEFORE any
+         writing begins, so it cannot collide with a write.
+      2) Burn that ISO to the blank CD-R with SPTIWriter, which talks to the drive
+         directly via IOCTL_SCSI_PASS_THROUGH_DIRECT and raw MMC commands (NO COM,
+         NO IMAPI2). Because we issue every WRITE(10) ourselves, progress is exact
+         (sectors written / total) and nothing can overlap the write.
+
+    Stdout line protocol the parent GUI parses:
+        PROGRESS <int 0-100>
+        STATUS <text>
+        LOG <text>
+        RESULT OK
+        RESULT FAIL <text>
+    """
+    import sys as _sys
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    def emit(line):
+        try:
+            _sys.stdout.write(line + "\n")
+            _sys.stdout.flush()
+        except Exception:
+            pass
+
+    def on_status(s):
+        emit("STATUS " + str(s))
+
+    def on_progress(p):
+        try:
+            emit("PROGRESS " + str(int(p)))
+        except Exception:
+            pass
+
+    def on_log(m):
+        emit("LOG " + str(m))
+
+    # COM is needed only for stage 1 (ISO authoring). Initialize MTA like the
+    # worker does so IMAPI2 does not deadlock without a message pump.
+    com_ready = False
+    try:
+        import comtypes
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except Exception:
+            import ctypes
+            ctypes.windll.ole32.CoInitializeEx(None, 0x0)
+        com_ready = True
+    except Exception as e:
+        emit("LOG COM init (MTA) warning: " + str(e))
+
+    iso_tmp = None
+    try:
+        from pyburn.services.imapi2_backend import IMAPI2Backend
+        from pyburn.services.spti_writer import SPTIWriter
+
+        files = [_Path(p) for p in args.file]
+        temp_dir = _Path(args.temp_dir) if args.temp_dir else _Path(_tempfile.gettempdir())
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        iso_tmp = temp_dir / ("pyburn_%d.iso" % (abs(hash(tuple(str(f) for f in files))) % 10_000_000))
+
+        # Stage 1: author the ISO (COM, before any write).
+        backend = IMAPI2Backend()
+        backend.build_iso(files, iso_tmp, args.volume, on_status, on_log)
+
+        # COM is done; we do not need it for the SPTI write. Uninitialize now so
+        # nothing COM is even alive during the write.
+        if com_ready:
+            try:
+                import comtypes
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+            com_ready = False
+
+        # Convert the CD x-multiplier speed to kbytes/sec for SET CD SPEED.
+        # 1x CD = 176.4 kB/s (1000-byte kB per MMC). 0 = fastest.
+        speed_kbps = 0
+        try:
+            s = str(args.speed).strip().lower()
+            if s not in ("", "auto"):
+                speed_kbps = int(round(float(s) * 176))
+        except Exception:
+            speed_kbps = 0
+
+        # Stage 2: burn via SPTI/MMC (no COM), real per-sector progress.
+        writer = SPTIWriter()
+        writer.burn_iso(iso_tmp, args.device, on_status, on_progress, on_log,
+                        speed_kbps=speed_kbps, dummy=args.dummy, eject_after=args.eject)
+
+        emit("PROGRESS 100")
+        emit("RESULT OK")
+        return 0
+    except Exception as e:
+        emit("RESULT FAIL " + str(e))
+        return 1
+    finally:
+        if com_ready:
+            try:
+                import comtypes
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+        # Clean up the temp ISO.
+        try:
+            if iso_tmp is not None and _Path(iso_tmp).exists():
+                _Path(iso_tmp).unlink()
+        except Exception:
+            pass
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PyBurn Studio")
     parser.add_argument("--self-test", action="store_true", help="Run built-in non-destructive self-tests")
+    sub = parser.add_subparsers(dest="cli_command")
+    p_bd = sub.add_parser("cli-burn-data", help=argparse.SUPPRESS)
+    p_bd.add_argument("--file", action="append", required=True, help="File or folder to add (repeatable)")
+    p_bd.add_argument("--device", required=True, help="Target drive, e.g. H:")
+    p_bd.add_argument("--volume", default="DATA_DISC", help="Volume label")
+    p_bd.add_argument("--temp-dir", default="", help="Temp directory")
+    p_bd.add_argument("--speed", default="Auto", help="Burn speed (Auto or x-multiplier)")
+    p_bd.add_argument("--auto-blank", action="store_true", help="Erase rewritable media if not blank")
+    p_bd.add_argument("--eject", action="store_true", help="Eject after burn")
+    p_bd.add_argument("--dummy", action="store_true", help="Simulate write (no disc written)")
     args = parser.parse_args()
     if args.self_test:
         sys.exit(self_test())
+    if args.cli_command == "cli-burn-data":
+        sys.exit(cli_burn_data(args))
     run_gui()
