@@ -91,7 +91,7 @@ class DataBurnTab(BaseTab):
         self.chk_blank.setChecked(bool(self.cfg.settings.get("auto_blank_rw", True)))
         self.chk_eject = QCheckBox("Eject after burn")
         self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
-        self.chk_dummy = QCheckBox("Dummy burn (cdrecord)")
+        self.chk_dummy = QCheckBox("Test burn (simulate, no disc written)")
         self.chk_dummy.setChecked(False)
         self.cbo_type = QComboBox()
         self.cbo_type.addItems(["CD (700MB)", "DVD (4.7GB)", "Blu-ray (25GB)"])

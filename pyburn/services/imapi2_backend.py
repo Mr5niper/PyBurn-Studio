@@ -147,6 +147,11 @@ class IMAPI2Backend:
                     info["type"] = "DVD"
                 elif mt in (14, 15, 16, 17, 18, 19):
                     info["type"] = "BD"
+                # Rewritable physical media types (IMAPI_MEDIA_PHYSICAL_TYPE):
+                # CDRW=3, DVDRAM=4, DVDPLUSRW=6, DVDPLUSRW_DL=8, DVDDASHRW=10,
+                # DVDDASHRW_DL=12, BDRE=17. Everything else (CDR=2, DVDR, BDR,
+                # etc.) is write-once and must NEVER be erased.
+                info["rewritable"] = mt in (3, 4, 6, 8, 10, 12, 17)
         except Exception:
             pass
         return info
@@ -156,12 +161,16 @@ class IMAPI2Backend:
             recorder = self._recorder_for(device)
             eraser = self._new("IMAPI2.MsftDiscFormat2Erase")
             eraser.Recorder = recorder
+            # ClientName is REQUIRED; without it EraseMedia throws
+            # "The client name is not valid."
+            eraser.ClientName = "PyBurn Studio"
             eraser.FullErase = False  # quick erase
             on_status("Erasing rewritable media (IMAPI2)...")
             eraser.EraseMedia()
+            on_log("IMAPI2 erase completed")
             return True
         except Exception as e:
-            on_log(f"IMAPI2 erase failed: {e}")
+            on_log(f"IMAPI2 erase failed: {e!r}")
             return False
 
     def eject(self, device: str) -> None:
@@ -216,69 +225,251 @@ class IMAPI2Backend:
 
     def burn_data(self, files: List[Path], device: str, temp_dir: Path, volume: str,
                   on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
-                  auto_blank: bool = True, eject_after: bool = True) -> None:
+                  auto_blank: bool = True, eject_after: bool = True, speed="Auto",
+                  dummy: bool = False) -> None:
         """Build a data image from files/folders and burn it, all via IMAPI2."""
-        recorder = self._recorder_for(device)
+        on_log(f"burn_data: start, device={device}, items={len(files)}")
+        on_log("burn_data: resolving recorder...")
+        recorder = self._recorder_for(device, on_log=on_log)
+        on_log("burn_data: recorder resolved OK")
         info = self.get_media_info(device)
-        if auto_blank and info.get("blank") is False:
+        on_log(f"burn_data: media info blank={info.get('blank')} rewritable={info.get('rewritable')} type={info.get('type')}")
+        # Only erase REWRITABLE media that is not blank. MediaHeuristicallyBlank
+        # gives false negatives on blank CD-Rs, and CD-R/DVD-R/BD-R are
+        # write-once and cannot be erased at all. Erasing (or trying to) a
+        # write-once disc fails and then blocks the burn, so gate on rewritable.
+        if auto_blank and info.get("rewritable") is True and info.get("blank") is False:
+            on_log("burn_data: rewritable media not blank, erasing...")
             self.blank(device, on_status, on_log)
+        elif info.get("blank") is False and info.get("rewritable") is not True:
+            on_log("burn_data: media reports not-blank but is write-once (CD-R/DVD-R/BD-R); "
+                   "not erasing. If this is a used write-once disc the write may fail; "
+                   "otherwise MediaHeuristicallyBlank is a false negative and the write will proceed.")
         on_status("Building data image (IMAPI2)...")
+        on_log("burn_data: creating MsftFileSystemImage...")
         fsi = self._new("IMAPI2FS.MsftFileSystemImage")
+        # ChooseImageDefaults(recorder) MUST run first: it inspects the disc in
+        # the drive and configures the image (file-system types, block count,
+        # media size) to match. Setting FreeMediaBlocks by hand afterwards is
+        # wrong; the previous code set it to -1, which is not "size to media" but
+        # a bogus block count, so the image was built for the wrong size and the
+        # drive rejected the write with an unrecoverable error. Let
+        # ChooseImageDefaults own the sizing.
         try:
-            fsi.FreeMediaBlocks = -1  # let IMAPI size to media
-        except Exception:
-            pass
-        try:
-            fsi.VolumeName = (volume or "DATA_DISC")[:32]
-        except Exception:
-            pass
-        # Choose Joliet + ISO9660 + UDF for broad compatibility.
-        try:
+            on_log("burn_data: ChooseImageDefaults(recorder)...")
             fsi.ChooseImageDefaults(recorder)
-        except Exception:
-            pass
-        root = fsi.Root
-        self._add_tree(root, files, on_log)
-        result = fsi.CreateResultImage()
-        image_stream = result.ImageStream
+        except Exception as e:
+            on_log(f"burn_data: ChooseImageDefaults warning: {e}")
+        # Link the filesystem image to the recorder's multisession state BEFORE
+        # building it. Create a MsftDiscFormat2Data now, and hand its
+        # MultisessionInterfaces to the image so the image is laid out for the
+        # actual disc (starting sector, session import). Without this the image
+        # is built assuming a layout that need not match the disc, and the write
+        # opens a session then fails. For a blank disc this simply starts a new
+        # session at 0; for an appendable disc it imports prior content.
         data = self._new("IMAPI2.MsftDiscFormat2Data")
         data.Recorder = recorder
         data.ClientName = "PyBurn Studio"
         try:
+            ms = data.MultisessionInterfaces
+            fsi.MultisessionInterfaces = ms
+            on_log("burn_data: linked MultisessionInterfaces to the image")
+        except Exception as e:
+            # On some blank-media/driver combinations this property is null and
+            # cannot be assigned; that is fine for a fresh single-session burn.
+            on_log(f"burn_data: MultisessionInterfaces not set ({e!r}); single-session burn")
+        try:
+            fsi.VolumeName = (volume or "DATA_DISC")[:32]
+        except Exception as e:
+            on_log(f"burn_data: VolumeName warning: {e}")
+        try:
+            # FsiFileSystemISO9660 (1) | FsiFileSystemJoliet (2) | FsiFileSystemUDF (4) = 7
+            fsi.FileSystemsToCreate = 7
+        except Exception as e:
+            on_log(f"burn_data: FileSystemsToCreate warning: {e}")
+        root = fsi.Root
+        added = self._add_tree(root, files, on_log)
+        if added == 0:
+            raise RuntimeError("No files could be added to the data image; nothing to burn.")
+        on_log(f"burn_data: added {added} item(s); creating result image...")
+        try:
+            result = fsi.CreateResultImage()
+            image_stream = result.ImageStream
+        except Exception as e:
+            raise RuntimeError(f"Failed to build the data image: {e!r}")
+        on_log("burn_data: data formatter ready (created before image for multisession link)")
+        # Log what the drive/media supports for diagnostics, but let IMAPI2
+        # choose the actual write speed (its default).
+        try:
+            cur = getattr(data, "CurrentMediaType", None)
+            on_log(f"burn_data: current media type = {cur}")
+        except Exception as e:
+            on_log(f"burn_data: media type query warning: {e}")
+        try:
+            descriptors = data.SupportedWriteSpeedDescriptors
+            speeds = []
+            for d in descriptors:
+                try:
+                    speeds.append((int(d.MediaType), int(d.WriteSpeed), int(d.RotationTypeIsPureCAV)))
+                except Exception:
+                    pass
+            on_log(f"burn_data: supported write-speed descriptors = {speeds}")
+        except Exception as e:
+            on_log(f"burn_data: write-speed query warning: {e}")
+        self._apply_write_speed(data, speed, on_log)
+        try:
             self._wire_progress(data, on_progress)
         except Exception:
             pass
+        # Diagnostics + correctness around the physical write:
+        # - Log the PHYSICAL media type and whether this formatter says the media
+        #   is supported. CurrentMediaType came back None, so confirm what the
+        #   formatter actually sees.
+        # - Acquire exclusive access to the recorder for the duration of the
+        #   write. Without it, the Windows shell / autoplay / indexing can hold
+        #   the drive and the physical write fails with an unrecoverable drive
+        #   error even though the image is valid. The audio TrackAtOnce path
+        #   happened to work without this, but data writing is stricter.
+        try:
+            phys = int(data.CurrentPhysicalMediaType)
+            on_log(f"burn_data: CurrentPhysicalMediaType = {phys}")
+        except Exception as e:
+            on_log(f"burn_data: physical media type warning: {e}")
+        try:
+            supported = bool(data.IsCurrentMediaSupported(recorder))
+            on_log(f"burn_data: IsCurrentMediaSupported = {supported}")
+        except Exception as e:
+            on_log(f"burn_data: media support query warning: {e}")
+        acquired = False
+        try:
+            recorder.AcquireExclusiveAccess(True, "PyBurn Studio")
+            acquired = True
+            on_log("burn_data: acquired exclusive access to recorder")
+        except Exception as e:
+            on_log(f"burn_data: AcquireExclusiveAccess warning (continuing): {e}")
         on_status("Burning data disc (IMAPI2)...")
+        if dummy:
+            try:
+                data.SimulateWrite = True
+                on_log("burn_data: DUMMY/TEST burn - SimulateWrite=True, laser off, disc NOT written")
+                on_status("Test burn (simulated, disc not written)...")
+            except Exception as e:
+                on_log(f"burn_data: SimulateWrite not available ({e!r}); cannot simulate, aborting to protect the disc")
+                raise RuntimeError("Dummy burn requested but this drive/driver does not support "
+                                   "IMAPI2 SimulateWrite; aborting so a disc is not consumed.")
+        on_log("burn_data: calling Write(image_stream)...")
+        burn_error = None
         try:
             data.Write(image_stream)
+            on_log("burn_data: Write() returned OK")
             on_progress(100)
             on_status("Data disc burned successfully (IMAPI2).")
+        except Exception as e:
+            burn_error = e
+            on_log(f"burn_data: FAILED Write: {e!r}")
         finally:
+            if acquired:
+                try:
+                    recorder.ReleaseExclusiveAccess()
+                    on_log("burn_data: released exclusive access")
+                except Exception:
+                    pass
             if eject_after:
                 try:
+                    on_log("burn_data: ejecting media...")
                     recorder.EjectMedia()
                 except Exception:
                     pass
+        if burn_error is not None:
+            raise RuntimeError(f"Data disc burn failed: {burn_error}")
 
-    def _add_tree(self, dir_item, files: List[Path], on_log: OnLog):
-        """Recursively add files/dirs into an IMAPI file system image directory."""
+    def build_iso(self, files: List[Path], out_iso: Path, volume: str,
+                  on_status: OnStatus, on_log: OnLog) -> Path:
+        """Build an ISO9660/Joliet/UDF image file from files/folders.
+
+        Uses IMAPI2's MsftFileSystemImage to author the image, then streams the
+        result image to a plain .iso file on disk. This is COM work, but it all
+        happens BEFORE any disc write, so it never overlaps a write (the reason
+        the SPTI writer exists is to avoid COM during the write; building the
+        image up front is fine). The produced .iso is then burned by SPTIWriter.
+        """
+        on_status("Building ISO image (IMAPI2 authoring)...")
+        on_log(f"build_iso: authoring image for {len(files)} item(s) -> {out_iso}")
+        fsi = self._new("IMAPI2FS.MsftFileSystemImage")
+        try:
+            fsi.FileSystemsToCreate = 7  # ISO9660 | Joliet | UDF
+        except Exception as e:
+            on_log(f"build_iso: FileSystemsToCreate warning: {e}")
+        try:
+            fsi.VolumeName = (volume or "DATA_DISC")[:32]
+        except Exception as e:
+            on_log(f"build_iso: VolumeName warning: {e}")
+        root = fsi.Root
+        added = self._add_tree(root, files, on_log)
+        if added == 0:
+            raise RuntimeError("No files could be added to the image; nothing to burn.")
+        on_log(f"build_iso: added {added} item(s); creating result image...")
+        result = fsi.CreateResultImage()
+        stream = result.ImageStream
+        # Stream is an IStream; read it in blocks and write to the .iso file.
+        # IStream.RemoteRead via comtypes returns (buffer, bytes_read). Read the
+        # block size from the image so the file is exactly the image size.
+        try:
+            block_size = int(result.ImageSize) if hasattr(result, "ImageSize") else 0
+        except Exception:
+            block_size = 0
+        out_iso = Path(out_iso)
+        out_iso.parent.mkdir(parents=True, exist_ok=True)
+        total = 0
+        CHUNK = 1024 * 1024
+        with open(out_iso, "wb") as fout:
+            while True:
+                try:
+                    data = stream.RemoteRead(CHUNK)
+                except Exception:
+                    # Some comtypes builds expose Read differently; fall back.
+                    data = None
+                if data is None:
+                    # Fallback: use the Stat size and a Seek/Read loop is not
+                    # available; bail if we cannot read.
+                    break
+                # RemoteRead returns (sequence_of_bytes, count) or bytes.
+                if isinstance(data, tuple):
+                    buf, count = data[0], data[1]
+                    chunk = bytes(bytearray(buf[:count]))
+                else:
+                    chunk = bytes(data)
+                if not chunk:
+                    break
+                fout.write(chunk)
+                total += len(chunk)
+        on_log(f"build_iso: wrote {total} bytes to {out_iso}")
+        if total == 0:
+            raise RuntimeError("ISO image came out empty; cannot burn.")
+        return out_iso
+
+    def _add_tree(self, dir_item, files: List[Path], on_log: OnLog) -> int:
+        """Recursively add files/dirs into an IMAPI file system image directory.
+        Returns the number of items successfully added."""
+        added = 0
         for p in files:
             try:
                 if p.is_dir():
-                    # AddTree adds the directory contents under a named subdir.
+                    on_log(f"burn_data: AddTree {p}")
                     dir_item.AddTree(str(p), False)
+                    added += 1
                 elif p.is_file():
-                    with open(p, "rb"):
-                        pass
-                    # AddFile takes a path relative in the image and an IStream.
+                    on_log(f"burn_data: AddFile {p.name}")
                     istream = self._istream_for_file(p)
                     dir_item.AddFile(p.name, istream)
+                    added += 1
             except Exception as e:
-                on_log(f"IMAPI2 add failed for {p}: {e}")
+                on_log(f"burn_data: add FAILED for {p}: {e!r}")
+        return added
 
     def burn_audio(self, wav_files: List[Path], device: str,
                    on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
-                   eject_after: bool = True) -> None:
+                   eject_after: bool = True, speed="Auto") -> None:
         """Burn Red Book audio tracks from 44100/16-bit stereo WAV files.
 
         Uses the TrackAtOnce interface. PrepareMedia() is called EXACTLY ONCE
@@ -303,6 +494,7 @@ class IMAPI2Backend:
         on_log("burn_audio: assigning recorder to formatter...")
         tao.Recorder = recorder
         tao.ClientName = "PyBurn Studio"
+        self._apply_write_speed(tao, speed, on_log)
         try:
             self._wire_progress(tao, on_progress, audio=True)
         except Exception:
@@ -452,26 +644,90 @@ class IMAPI2Backend:
             # On any parsing trouble, fall back to the raw file stream.
             return self._istream_for_file(wav)
 
+    def _apply_write_speed(self, formatter, speed, on_log: OnLog):
+        """Honor the user's Setup burn-speed choice on an IMAPI2 formatter.
+
+        `speed` is either "Auto" (let IMAPI2 pick, the default) or a CD-style
+        x-multiplier string like "8", "16", "24". One CD "x" is 150 KB/s, so we
+        convert and pick the supported descriptor closest to (but not above) the
+        requested KB/s. If anything is unavailable we leave IMAPI2 on its
+        default rather than fail the burn.
+        """
+        try:
+            if speed is None:
+                return
+            s = str(speed).strip().lower()
+            if s in ("", "auto"):
+                on_log("burn: write speed = Auto (IMAPI2 default)")
+                return
+            mult = int(float(s))
+            want_kbps = mult * 150  # 1x CD = 150 KB/s
+            # Find the closest supported speed at or below the request.
+            best = None
+            try:
+                for d in formatter.SupportedWriteSpeedDescriptors:
+                    ws = int(d.WriteSpeed)
+                    if ws <= want_kbps and (best is None or ws > best[0]):
+                        best = (ws, d)
+                # If none at or below, take the slowest available.
+                if best is None:
+                    for d in formatter.SupportedWriteSpeedDescriptors:
+                        ws = int(d.WriteSpeed)
+                        if best is None or ws < best[0]:
+                            best = (ws, d)
+            except Exception:
+                best = None
+            if best is not None:
+                rot = getattr(best[1], "RotationTypeIsPureCAV", False)
+                on_log(f"burn: requested {mult}x (~{want_kbps} KB/s); setting {best[0]} KB/s")
+                formatter.SetWriteSpeed(best[0], rot)
+            else:
+                on_log(f"burn: requested {mult}x (~{want_kbps} KB/s); no descriptors, using default")
+        except Exception as e:
+            on_log(f"burn: write-speed selection warning: {e}")
+
     def _wire_progress(self, formatter, on_progress: OnProgress, audio: bool = False):
         """Best-effort connect an IMAPI2 progress event sink.
 
-        comtypes can generate the event interface from the type library; if that
-        fails on a given box we simply skip live progress (the write still runs)
-        and rely on coarse start/finish updates.
+        CRITICAL: the sink callback runs INSIDE the synchronous Write() on the
+        burn engine thread. If it raises for ANY reason (unexpected argument
+        count, a property not present on this driver's event args, a type error),
+        that exception propagates into the COM write and can corrupt or abort the
+        burn, producing a bad/incomplete disc, while a simulated write (which
+        fires events differently) looks fine. So the callback must never be able
+        to raise: it accepts any arguments and swallows everything. Wiring the
+        sink is itself optional; if it fails, the write still runs, so the final
+        handler returns None instead of re-raising.
         """
         try:
             import comtypes.client
 
             class _Sink:
-                def Update(self, sender, args):  # noqa: N802
+                def Update(self, *args):  # noqa: N802  accept ANY args
                     try:
-                        total = int(args.SectorCount)
-                        written = int(args.LastWrittenLba) - int(args.StartLba)
+                        # The progress args object is normally the 2nd argument,
+                        # but never assume; probe defensively and never raise.
+                        pa = args[1] if len(args) > 1 else (args[0] if args else None)
+                        if pa is None:
+                            return
+                        total = int(getattr(pa, "SectorCount", 0) or 0)
+                        last = int(getattr(pa, "LastWrittenLba", 0) or 0)
+                        start = int(getattr(pa, "StartLba", 0) or 0)
+                        written = last - start
                         if total > 0:
                             on_progress(max(0, min(100, int((written / total) * 100))))
                     except Exception:
+                        # NEVER let a progress callback raise into the burn.
                         pass
 
-            comtypes.client.GetEvents(formatter, _Sink())
+                # Some IMAPI2 event interfaces fire other named methods too.
+                # Provide a catch-all so dispatch can never fail on a name.
+                def __getattr__(self, name):
+                    def _noop(*a, **k):
+                        return None
+                    return _noop
+
+            return comtypes.client.GetEvents(formatter, _Sink())
         except Exception:
-            raise
+            # Could not wire events; the write proceeds without live progress.
+            return None
