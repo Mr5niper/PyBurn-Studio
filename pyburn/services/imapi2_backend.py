@@ -624,23 +624,45 @@ class IMAPI2Backend:
     def _wire_progress(self, formatter, on_progress: OnProgress, audio: bool = False):
         """Best-effort connect an IMAPI2 progress event sink.
 
-        comtypes can generate the event interface from the type library; if that
-        fails on a given box we simply skip live progress (the write still runs)
-        and rely on coarse start/finish updates.
+        CRITICAL: the sink callback runs INSIDE the synchronous Write() on the
+        burn engine thread. If it raises for ANY reason (unexpected argument
+        count, a property not present on this driver's event args, a type error),
+        that exception propagates into the COM write and can corrupt or abort the
+        burn, producing a bad/incomplete disc, while a simulated write (which
+        fires events differently) looks fine. So the callback must never be able
+        to raise: it accepts any arguments and swallows everything. Wiring the
+        sink is itself optional; if it fails, the write still runs, so the final
+        handler returns None instead of re-raising.
         """
         try:
             import comtypes.client
 
             class _Sink:
-                def Update(self, sender, args):  # noqa: N802
+                def Update(self, *args):  # noqa: N802  accept ANY args
                     try:
-                        total = int(args.SectorCount)
-                        written = int(args.LastWrittenLba) - int(args.StartLba)
+                        # The progress args object is normally the 2nd argument,
+                        # but never assume; probe defensively and never raise.
+                        pa = args[1] if len(args) > 1 else (args[0] if args else None)
+                        if pa is None:
+                            return
+                        total = int(getattr(pa, "SectorCount", 0) or 0)
+                        last = int(getattr(pa, "LastWrittenLba", 0) or 0)
+                        start = int(getattr(pa, "StartLba", 0) or 0)
+                        written = last - start
                         if total > 0:
                             on_progress(max(0, min(100, int((written / total) * 100))))
                     except Exception:
+                        # NEVER let a progress callback raise into the burn.
                         pass
 
-            comtypes.client.GetEvents(formatter, _Sink())
+                # Some IMAPI2 event interfaces fire other named methods too.
+                # Provide a catch-all so dispatch can never fail on a name.
+                def __getattr__(self, name):
+                    def _noop(*a, **k):
+                        return None
+                    return _noop
+
+            return comtypes.client.GetEvents(formatter, _Sink())
         except Exception:
-            raise
+            # Could not wire events; the write proceeds without live progress.
+            return None
