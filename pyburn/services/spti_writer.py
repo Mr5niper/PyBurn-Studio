@@ -399,7 +399,23 @@ class SPTIWriter:
 
             on_status("Burning audio CD (SPTI/MMC)..." + (" [TEST]" if dummy else ""))
             written = 0
-            lba = 0
+            # The mandatory 2-second pre-gap before track 1 must be physically
+            # written as 150 blocks of silence, starting at LBA -150, so the LBA
+            # increases from -150 to 0 (cookbook lines 433-435). The cue sheet
+            # already declares this pre-gap; if we do not write these blocks the
+            # drive's expected layout and the actual writes disagree.
+            silence = bytearray(AUDIO_SECTOR * SECTORS_PER_WRITE)
+            lba = -150
+            remaining_pregap = 150
+            while remaining_pregap > 0:
+                n = min(SECTORS_PER_WRITE, remaining_pregap)
+                blk = bytes(silence[:AUDIO_SECTOR * n])
+                if not self._write10_audio(handle, lba, n, bytearray(blk), on_log):
+                    raise RuntimeError(f"Audio pre-gap write failed at sector {lba}.")
+                lba += n
+                remaining_pregap -= n
+            # Now lba == 0; write the track payload contiguously (no gaps between
+            # tracks in a pure-audio SAO session, cookbook line 443).
             for ti, t in enumerate(tracks, start=1):
                 pcm = t["pcm"]
                 off = 0
@@ -419,10 +435,9 @@ class SPTIWriter:
             if not self._synchronize_cache(handle, on_log):
                 raise RuntimeError("SYNCHRONIZE CACHE failed; disc may be incomplete.")
 
-            on_status("Closing session (SPTI/MMC)...")
-            if not self._close_track_session(handle, 0x02, 0, on_log):
-                on_log("spti-audio: session close returned an error; audio is written "
-                       "but the disc may be unfinalized.")
+            # SAO: no CLOSE TRACK SESSION is needed; SYNCHRONIZE CACHE finalizes
+            # the disc (cookbook line 456). Sending it caused errors on some
+            # drives, so we deliberately omit it here.
 
             on_progress(100)
             on_status("Audio CD burned successfully (SPTI/MMC).")
@@ -504,8 +519,11 @@ class SPTIWriter:
         for i, t in enumerate(tracks, start=1):
             start = t["start_lba"]
             if i == 1:
+                # Track 1 mandatory 2s pre-gap (INDEX0) at LBA -150 -> MSF
+                # 00:00:00. DATA FORM = 00h for audio payload pause per cookbook
+                # line 338 ("00h for audio and 10h for data").
                 m0, s0, f0 = self._lba_to_msf(-150)
-                entry(AUDIO_CTLADR, 0x01, 0x00, 0x01, m0, s0, f0)  # track1 pre-gap
+                entry(AUDIO_CTLADR, 0x01, 0x00, 0x00, m0, s0, f0)  # track1 pre-gap
             m1, s1, f1 = self._lba_to_msf(start)
             entry(AUDIO_CTLADR, i & 0xFF, 0x01, 0x00, m1, s1, f1)  # INDEX1
 
@@ -526,12 +544,12 @@ class SPTIWriter:
 
     def _write10_audio(self, handle, lba: int, sectors: int, data: bytearray, on_log: OnLog) -> bool:
         # Same WRITE(10) opcode; transfer length is in 2352-byte audio sectors,
-        # and the drive is in raw-audio block mode from MODE SELECT.
-        cdb = bytes([0x2A, 0x00,
-                     (lba >> 24) & 0xFF, (lba >> 16) & 0xFF, (lba >> 8) & 0xFF, lba & 0xFF,
-                     0x00,
-                     (sectors >> 8) & 0xFF, sectors & 0xFF,
-                     0x00])
+        # and the drive is in raw-audio block mode from MODE SELECT. The LBA may
+        # be NEGATIVE for the pre-gap; encode it as signed 32-bit big-endian
+        # two's-complement (-150 -> FF FF FF 6A), per cookbook line 411-412.
+        lba_bytes = struct.pack(">i", lba)
+        cdb = bytes([0x2A, 0x00]) + lba_bytes + bytes([0x00,
+                     (sectors >> 8) & 0xFF, sectors & 0xFF, 0x00])
         ok, sense, _d, status = self._scsi(handle, cdb, SCSI_IOCTL_DATA_OUT,
                                            data=data, timeout=120)
         if not ok:
