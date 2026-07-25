@@ -130,6 +130,9 @@ class BurnWorker(QObject):
         if self.job.job_type == JobType.DATA:
             self._run_imapi2_data_subprocess()
             return
+        if self.job.job_type == JobType.AUDIO:
+            self._run_spti_audio_subprocess()
+            return
 
         from .imapi2_backend import IMAPI2Backend
         o = self.job.options
@@ -255,6 +258,88 @@ class BurnWorker(QObject):
                 result_msg = f"Burn process exited with code {rc}"
         self.sig_finished.emit(bool(result_ok), result_msg)
 
+    def _cli_base_cmd(self, subcommand: str):
+        """Build the [exe, subcommand] prefix to re-invoke ourselves."""
+        import sys as _sys
+        if getattr(_sys, "frozen", False):
+            return [_sys.executable, subcommand]
+        import os
+        script = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), "pyburn_studio.py")
+        return [_sys.executable, script, subcommand]
+
+    def _pump_burn_subprocess(self, cmd, ok_msg: str):
+        """Launch cmd, translate its PROGRESS/STATUS/LOG/RESULT stdout into
+        signals, and emit sig_finished. Shared by data and audio burns."""
+        import subprocess
+        self.sig_log.emit(f"Launching isolated burn process ({cmd[1] if len(cmd) > 1 else '?'})...")
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW
+        except Exception:
+            creationflags = 0x08000000
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, creationflags=creationflags,
+            )
+        except Exception as e:
+            self.sig_finished.emit(False, f"Could not start burn process: {e}")
+            return
+        self._burn_proc = proc
+        result_ok = None
+        result_msg = ok_msg
+        try:
+            for raw in proc.stdout:
+                line = raw.rstrip("\r\n")
+                if not line:
+                    continue
+                if line.startswith("PROGRESS "):
+                    try:
+                        self.sig_progress.emit(int(line[9:].strip()))
+                    except Exception:
+                        pass
+                elif line.startswith("STATUS "):
+                    self.sig_status.emit(line[7:])
+                elif line.startswith("LOG "):
+                    self.sig_log.emit(line[4:])
+                elif line.startswith("RESULT OK"):
+                    result_ok = True
+                elif line.startswith("RESULT FAIL"):
+                    result_ok = False
+                    msg = line[len("RESULT FAIL"):].strip()
+                    if msg:
+                        result_msg = msg
+                else:
+                    self.sig_log.emit(line)
+        except Exception as e:
+            self.sig_log.emit(f"Error reading burn process output: {e}")
+        rc = proc.wait()
+        if result_ok is None:
+            result_ok = (rc == 0)
+            if not result_ok:
+                result_msg = f"Burn process exited with code {rc}"
+        self.sig_finished.emit(bool(result_ok), result_msg)
+
+    def _run_spti_audio_subprocess(self):
+        """Decode inputs to WAV, then burn a CD-DA audio disc via the SPTI
+        subprocess (cli-burn-audio). No COM anywhere."""
+        o = self.job.options
+        try:
+            self.sig_status.emit("Decoding audio to WAV...")
+            wavs = self._decode_audio_to_wav(self.job.files, o.temp_dir)
+            self.sig_log.emit(f"Decoded {len(wavs)} tracks; launching SPTI audio burn...")
+        except Exception as e:
+            self.sig_finished.emit(False, f"Audio decode failed: {e}")
+            return
+        cmd = self._cli_base_cmd("cli-burn-audio")
+        for w in wavs:
+            cmd += ["--file", str(w)]
+        cmd += ["--device", str(self.job.device), "--speed", str(o.speed or "Auto")]
+        if o.eject_after:
+            cmd += ["--eject"]
+        if getattr(o, "dummy", False):
+            cmd += ["--dummy"]
+        self._pump_burn_subprocess(cmd, "Audio CD created successfully (SPTI/MMC)")
 
     def _decode_audio_to_wav(self, files, temp_dir: Path):
         # IMAPI2 audio wants 44100/16/stereo WAV. Use native ffmpeg if present,
