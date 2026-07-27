@@ -210,9 +210,13 @@ class SetupDialog(QDialog):
                             "<b>Enable DVD/Blu-ray (WSL2)</b>; if Windows needs the WSL feature "
                             "enabled first, the app will start that (you approve one Windows "
                             "prompt and may need one reboot), then finish the rest.<br>")
-            html.append("<br>Native Windows notes: data discs, audio CD, blanking and ripping "
-                        "run through the built-in Windows engine and IOCTL, no external tools "
-                        "needed. Installing ffmpeg improves audio decode and rip encoding.")
+            html.append("<br>Native Windows notes: data discs and audio CDs burn through a "
+                        "built-in SPTI/MMC engine that talks to the drive directly, and ripping "
+                        "reads through IOCTL, so no external tools are needed for these. "
+                        "First-time setup: nothing is required to burn or rip. Optionally click "
+                        "<b>Download ffmpeg</b> to improve audio decode and rip encoding, and only "
+                        "if you want Video DVD or Blu-ray, click <b>Enable DVD/Blu-ray (WSL2)</b> "
+                        "to install the Linux authoring tools.")
             self.btn_dvdbd.setEnabled(not self._busy)
         else:
             html.append("<br>On Linux all features run through the standard command-line tools. "

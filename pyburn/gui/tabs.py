@@ -12,12 +12,15 @@ from PyQt6.QtGui import QFont
 from ..core.config import Config
 from ..core.jobs import Job, JobOptions, JobType
 from ..core.tools import ToolFinder
-from .widgets import FileListWidget, CapacityGauge, compute_total_size
+from .widgets import FileListWidget, CapacityGauge, compute_total_size, compute_total_duration, dvd_max_minutes, bd_max_minutes
 from ..services.queue import JobQueueService
 from ..services.metadata import musicbrainz_lookup
 from ..services.media import MediaTools
 from ..services.exec import ProcessRunner
 
+# CD_BYTES / DVD_BYTES are byte capacities used by the data-disc gauge. Video
+# DVD capacity is time-based and computed by the fit-to-disc model in widgets.py
+# (dvd_max_minutes), so there is no fixed DVD minutes constant here anymore.
 CD_BYTES = 737_280_000
 DVD_BYTES = 4_700_000_000
 BD25_BYTES = 25_000_000_000
@@ -88,7 +91,7 @@ class DataBurnTab(BaseTab):
         self.chk_blank.setChecked(bool(self.cfg.settings.get("auto_blank_rw", True)))
         self.chk_eject = QCheckBox("Eject after burn")
         self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
-        self.chk_dummy = QCheckBox("Dummy burn (cdrecord)")
+        self.chk_dummy = QCheckBox("Test burn (simulate, no disc written)")
         self.chk_dummy.setChecked(False)
         self.cbo_type = QComboBox()
         self.cbo_type.addItems(["CD (700MB)", "DVD (4.7GB)", "Blu-ray (25GB)"])
@@ -102,7 +105,7 @@ class DataBurnTab(BaseTab):
         lay.addWidget(opts)
         self.gauge = CapacityGauge(DVD_BYTES)
         lay.addWidget(self.gauge)
-        self.btn = QPushButton("Queue Job: Burn Data Disc")
+        self.btn = QPushButton("Burn Data Disc")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -201,7 +204,7 @@ class DataBurnTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
 
 
 class AudioCDTab(BaseTab):
@@ -239,12 +242,12 @@ class AudioCDTab(BaseTab):
         self.btn_guess = QPushButton("Guess Track Titles From Filenames")
         self.btn_guess.clicked.connect(self._guess_titles)
         lay.addWidget(self.btn_guess)
-        self.gauge = CapacityGauge(CD_BYTES)
+        self.gauge = CapacityGauge(CD_BYTES, mode="minutes", max_minutes=80.0)
         lay.addWidget(self.gauge)
         self.chk_eject = QCheckBox("Eject after burn")
         self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
         lay.addWidget(self.chk_eject)
-        self.btn = QPushButton("Queue Job: Create Audio CD")
+        self.btn = QPushButton("Burn Audio CD")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -280,7 +283,59 @@ class AudioCDTab(BaseTab):
             QMessageBox.information(self, "CD-Text", f"Generated {len(self.track_titles)} track titles.")
 
     def _refresh(self, files: List[str]):
-        self.gauge.update_size(compute_total_size(files))
+        # Audio CDs are limited by playback time, not bytes. Compute total
+        # duration with ffprobe in a background thread so dropping in a full
+        # album does not freeze the UI. Fall back to a rough estimate if ffprobe
+        # is unavailable.
+        #
+        # IMPORTANT: adding files fires this repeatedly. Each run starts a
+        # QThread, and we MUST keep a reference to every running thread until it
+        # finishes; otherwise Python garbage-collects a still-running QThread and
+        # the app crashes hard with no error. We keep a set of live threads and
+        # drop each one only when it has finished.
+        ffprobe = self.tools.find("ffprobe")
+        file_list = list(files)
+        if not file_list:
+            self.gauge.update_duration(0.0)
+            return
+
+        if not hasattr(self, "_dur_threads"):
+            self._dur_threads = set()
+
+        class DurThread(QThread):
+            done = pyqtSignal(float)
+
+            def __init__(self, paths, probe):
+                super().__init__()
+                self.paths = paths
+                self.probe = probe
+
+            def run(self):
+                try:
+                    secs = compute_total_duration(self.paths, self.probe)
+                except Exception:
+                    secs = 0.0
+                self.done.emit(secs)
+
+        snapshot = file_list
+        thread = DurThread(file_list, ffprobe)
+
+        def on_done(secs, th=thread):
+            try:
+                if secs and secs > 0:
+                    self.gauge.update_duration(secs)
+                else:
+                    est_seconds = compute_total_size(snapshot) / (10 * 1024 * 1024) * 60.0
+                    self.gauge.update_duration(est_seconds)
+            finally:
+                # Now that it has finished, stop tracking it. Do this after the
+                # thread has fully finished to avoid destroying a running thread.
+                self._dur_threads.discard(th)
+
+        thread.done.connect(on_done)
+        thread.finished.connect(lambda th=thread: self._dur_threads.discard(th))
+        self._dur_threads.add(thread)
+        thread.start()
 
     def _add(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Select Audio Files", "", "Audio (*.mp3 *.wav *.flac *.ogg *.m4a *.aac)")
@@ -300,10 +355,19 @@ class AudioCDTab(BaseTab):
         if self.track_titles and len(self.track_titles) != cnt:
             QMessageBox.warning(self, "CD-Text", "Track titles count does not match number of files.")
             return
+        # Warn if total playback time exceeds the disc (audio CDs hold ~80 min).
+        if self.gauge.current_seconds > self.gauge.max_minutes * 60.0:
+            r = QMessageBox.question(
+                self, "Over Capacity",
+                f"Total playback time is {int(self.gauge.current_seconds // 60)} min, which "
+                f"exceeds the {int(self.gauge.max_minutes)}-minute audio CD limit.\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                return
         temp_dir = Path(self.cfg.settings["temp_dir"])
-        needed = max(1, self.gauge.current_size)
+        # Temp space for decoding: CD audio is ~10 MB/min, so size by duration.
+        needed = max(1, int((self.gauge.current_seconds / 60.0) * 10 * 1024 * 1024))
         free = disk_free_bytes(temp_dir)
-        # Audio conversion slack ~1.5x
         if free < needed * 1.5:
             r = QMessageBox.question(self, "Low Temp Space",
                                      "Audio conversion may need extra temp space.\nContinue?",
@@ -325,7 +389,7 @@ class AudioCDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
 
 
 class VideoDVDTab(BaseTab):
@@ -348,7 +412,7 @@ class VideoDVDTab(BaseTab):
         for b in (b_add, b_rm, b_cl):
             row.addWidget(b)
         lay.addLayout(row)
-        self.gauge = CapacityGauge(DVD_BYTES)
+        self.gauge = CapacityGauge(DVD_BYTES, mode="minutes", max_minutes=dvd_max_minutes())
         lay.addWidget(self.gauge)
         self.chk_blank = QCheckBox("Auto-blank RW media")
         self.chk_blank.setChecked(bool(self.cfg.settings.get("auto_blank_rw", True)))
@@ -356,7 +420,7 @@ class VideoDVDTab(BaseTab):
         self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
         lay.addWidget(self.chk_blank)
         lay.addWidget(self.chk_eject)
-        self.btn = QPushButton("Queue Job: Create Video DVD")
+        self.btn = QPushButton("Burn Video DVD")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -365,7 +429,47 @@ class VideoDVDTab(BaseTab):
         self._refresh(self.list.get_file_list())
 
     def _refresh(self, files: List[str]):
-        self.gauge.update_size(compute_total_size(files))
+        # Video DVD capacity is governed by playback time at the fixed pal-dvd
+        # transcode bitrate, NOT by the compressed source size (an h.264 MP4 and
+        # a much larger MKV of the same length produce nearly identical MPEG-2).
+        # Measure total duration with ffprobe in a background thread so dropping
+        # in long videos does not freeze the UI, exactly like the audio CD tab.
+        ffprobe = self.tools.find("ffprobe")
+        file_list = list(files)
+        if not file_list:
+            self.gauge.update_duration(0.0)
+            return
+
+        if not hasattr(self, "_dur_threads"):
+            self._dur_threads = set()
+
+        class DurThread(QThread):
+            done = pyqtSignal(float)
+
+            def __init__(self, paths, probe):
+                super().__init__()
+                self.paths = paths
+                self.probe = probe
+
+            def run(self):
+                try:
+                    secs = compute_total_duration(self.paths, self.probe)
+                except Exception:
+                    secs = 0.0
+                self.done.emit(secs)
+
+        thread = DurThread(file_list, ffprobe)
+
+        def on_done(secs, th=thread):
+            try:
+                self.gauge.update_duration(secs if secs and secs > 0 else 0.0)
+            finally:
+                self._dur_threads.discard(th)
+
+        thread.done.connect(on_done)
+        thread.finished.connect(lambda th=thread: self._dur_threads.discard(th))
+        self._dur_threads.add(thread)
+        thread.start()
 
     def _confirm_blank_if_needed(self, device: str) -> bool:
         if not self.chk_blank.isChecked():
@@ -398,17 +502,30 @@ class VideoDVDTab(BaseTab):
         if self.list.count() == 0:
             QMessageBox.warning(self, "No Files", "Add video files.")
             return
+        # DVD-Video capacity is playback time at the pal-dvd bitrate (~100 min on
+        # a single layer). Warn if the total runtime exceeds that.
+        if self.gauge.current_seconds > self.gauge.max_minutes * 60.0:
+            r = QMessageBox.question(
+                self, "Over Capacity",
+                f"Total video runtime is {int(self.gauge.current_seconds // 60)} min, which "
+                f"exceeds the ~{int(self.gauge.max_minutes)}-minute single-layer DVD limit.\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                return
         device = self.cfg.settings.get("default_device", "/dev/sr0")
         if not self._confirm_blank_if_needed(device):
             QMessageBox.information(self, "Cancelled", "Blanking cancelled. Job not queued.")
             return
         temp_dir = Path(self.cfg.settings["temp_dir"])
-        needed = max(1, self.gauge.current_size)
+        # With fit-to-disc bitrate the authored output is always about one full
+        # DVD (~4.7 GB) regardless of runtime; authoring + ISO roughly doubles
+        # that on disk at peak.
+        needed = DVD_BYTES
         free = disk_free_bytes(temp_dir)
-        # Video authoring: 2.5x
-        if free < needed * 2.5:
+        if free < needed * 2.0:
             r = QMessageBox.question(self, "Low Temp Space",
-                                     "Transcoding may require large temporary space.\nContinue?",
+                                     f"DVD authoring needs about {needed*2.0/1e9:.1f} GB free; "
+                                     f"about {free/1e9:.1f} GB available.\nContinue?",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if r != QMessageBox.StandardButton.Yes:
                 return
@@ -421,7 +538,7 @@ class VideoDVDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
 
 
 class VideoBDTab(BaseTab):
@@ -444,7 +561,7 @@ class VideoBDTab(BaseTab):
         for b in (b_add, b_rm, b_cl):
             row.addWidget(b)
         lay.addLayout(row)
-        self.gauge = CapacityGauge(BD25_BYTES)
+        self.gauge = CapacityGauge(BD25_BYTES, mode="minutes", max_minutes=bd_max_minutes())
         lay.addWidget(self.gauge)
         self.chk_blank = QCheckBox("Auto-blank RW media")
         self.chk_blank.setChecked(bool(self.cfg.settings.get("auto_blank_rw", True)))
@@ -452,7 +569,7 @@ class VideoBDTab(BaseTab):
         self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
         lay.addWidget(self.chk_blank)
         lay.addWidget(self.chk_eject)
-        self.btn = QPushButton("Queue Job: Create Blu-ray")
+        self.btn = QPushButton("Burn Blu-ray")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -461,7 +578,45 @@ class VideoBDTab(BaseTab):
         self._refresh(self.list.get_file_list())
 
     def _refresh(self, files: List[str]):
-        self.gauge.update_size(compute_total_size(files))
+        # Blu-ray capacity, like DVD, is governed by playback time at the
+        # fit-to-disc transcode bitrate, not by the compressed source size.
+        # Measure total duration with ffprobe in a background thread.
+        ffprobe = self.tools.find("ffprobe")
+        file_list = list(files)
+        if not file_list:
+            self.gauge.update_duration(0.0)
+            return
+
+        if not hasattr(self, "_dur_threads"):
+            self._dur_threads = set()
+
+        class DurThread(QThread):
+            done = pyqtSignal(float)
+
+            def __init__(self, paths, probe):
+                super().__init__()
+                self.paths = paths
+                self.probe = probe
+
+            def run(self):
+                try:
+                    secs = compute_total_duration(self.paths, self.probe)
+                except Exception:
+                    secs = 0.0
+                self.done.emit(secs)
+
+        thread = DurThread(file_list, ffprobe)
+
+        def on_done(secs, th=thread):
+            try:
+                self.gauge.update_duration(secs if secs and secs > 0 else 0.0)
+            finally:
+                self._dur_threads.discard(th)
+
+        thread.done.connect(on_done)
+        thread.finished.connect(lambda th=thread: self._dur_threads.discard(th))
+        self._dur_threads.add(thread)
+        thread.start()
 
     def _confirm_blank_if_needed(self, device: str) -> bool:
         if not self.chk_blank.isChecked():
@@ -494,16 +649,29 @@ class VideoBDTab(BaseTab):
         if self.list.count() == 0:
             QMessageBox.warning(self, "No Files", "Add video files.")
             return
+        # BD capacity is playback time at the fit-to-disc bitrate; warn if the
+        # total runtime exceeds what fits at acceptable quality.
+        if self.gauge.current_seconds > self.gauge.max_minutes * 60.0:
+            r = QMessageBox.question(
+                self, "Over Capacity",
+                f"Total video runtime is {int(self.gauge.current_seconds // 60)} min, which "
+                f"exceeds the ~{int(self.gauge.max_minutes)}-minute single-layer Blu-ray limit.\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                return
         device = self.cfg.settings.get("default_device", "/dev/sr0")
         if not self._confirm_blank_if_needed(device):
             QMessageBox.information(self, "Cancelled", "Blanking cancelled. Job not queued.")
             return
         temp_dir = Path(self.cfg.settings["temp_dir"])
-        needed = max(1, self.gauge.current_size)
+        # Fit-to-disc output is about one full BD-25 (~23.5 GB) regardless of
+        # runtime; authoring + image roughly doubles that on disk at peak.
+        needed = BD25_BYTES
         free = disk_free_bytes(temp_dir)
-        if free < needed * 2.5:
+        if free < needed * 2.0:
             r = QMessageBox.question(self, "Low Temp Space",
-                                     "BD authoring may require large temporary space.\nContinue?",
+                                     f"Blu-ray authoring needs about {needed*2.0/1e9:.1f} GB free; "
+                                     f"about {free/1e9:.1f} GB available.\nContinue?",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if r != QMessageBox.StandardButton.Yes:
                 return
@@ -516,7 +684,7 @@ class VideoBDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
 
 
 class RipCDTab(BaseTab):
@@ -551,7 +719,7 @@ class RipCDTab(BaseTab):
         self.btn_mb = QPushButton("Lookup Metadata (MusicBrainz)")
         self.btn_mb.clicked.connect(self._lookup_mb)
         lay.addWidget(self.btn_mb)
-        self.btn = QPushButton("Queue Job: Rip CD")
+        self.btn = QPushButton("Start Ripping CD")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
@@ -598,28 +766,33 @@ class RipCDTab(BaseTab):
         self._mb_thread = th  # hold ref
 
     def _start(self):
-        # Require cdparanoia for real ripping
-        missing = self.tools.missing(["cdparanoia"])
-        if missing:
-            if self.cfg.settings.get("simulate_when_missing_tools", True):
-                r = QMessageBox.question(
-                    self,
-                    "Required Tool Missing",
-                    "The required tool 'cdparanoia' is not installed.\n\n"
-                    "Do you want to run a SIMULATED rip (for testing) instead?\n\n"
-                    "Choose No to cancel so you can install cdparanoia first.",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                if r != QMessageBox.StandardButton.Yes:
+        # Ripping route depends on platform. On Windows the native IOCTL ripper
+        # reads CD audio with NO external tool (cdparanoia is a Unix tool with no
+        # Windows build), so requiring it here was wrong and blocked Windows rips.
+        # Only gate on cdparanoia for the CLI path (Linux/macOS).
+        from ..services.platform_caps import is_windows
+        if not is_windows():
+            missing = self.tools.missing(["cdparanoia"])
+            if missing:
+                if self.cfg.settings.get("simulate_when_missing_tools", True):
+                    r = QMessageBox.question(
+                        self,
+                        "Required Tool Missing",
+                        "The required tool 'cdparanoia' is not installed.\n\n"
+                        "Do you want to run a SIMULATED rip (for testing) instead?\n\n"
+                        "Choose No to cancel so you can install cdparanoia first.",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if r != QMessageBox.StandardButton.Yes:
+                        return
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Required Tool Missing",
+                        "The required tool 'cdparanoia' is not installed.\n"
+                        "Install it and try again."
+                    )
                     return
-            else:
-                QMessageBox.warning(
-                    self,
-                    "Required Tool Missing",
-                    "The required tool 'cdparanoia' is not installed.\n"
-                    "Install it and try again."
-                )
-                return
         out = Path(self.ed_out.text())
         job = Job(
             job_type=JobType.RIP,
@@ -635,4 +808,4 @@ class RipCDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Queued", f"Enqueued: {job.display_name}")
+        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")

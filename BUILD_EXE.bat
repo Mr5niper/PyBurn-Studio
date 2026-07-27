@@ -61,31 +61,36 @@ echo [INFO] Python version matches. Starting build process...
 :: Fail early with a clear message if either is missing.
 if not exist pyburn.ico (
     echo [ERROR] pyburn.ico not found in the project root.
-    echo         The build needs pyburn.ico next to pyburn_studio.spec.
+    echo         The build needs pyburn.ico next to pyburn_studio.py.
     goto :error
 )
 if not exist version.txt (
     echo [ERROR] version.txt not found in the project root.
-    echo         The build needs version.txt next to pyburn_studio.spec.
+    echo         The build needs version.txt next to pyburn_studio.py.
     goto :error
 )
 
-:: 1. Create Virtual Environment
-echo [STEP 1/4] Creating virtual environment in '.\venv'...
+:: 1. Create a CLEAN Virtual Environment
+echo [STEP 1/5] Creating a clean virtual environment in '.\venv'...
 
-if not exist .\venv (
-    :: Build the venv with the verified py-launcher 3.13, not bare 'python'.
-    %PY% -m venv .\venv
-    if errorlevel 1 (
-        echo [ERROR] Failed to create virtual environment.
-        goto :error
-    )
-) else (
-    echo [INFO] Virtual environment '.\venv' already exists. Skipping creation.
+:: Always start from a fresh venv. Reusing an old venv is how a wrong dependency
+:: version (for example a comtypes that breaks the IMAPI2 audio-burn IStream
+:: import) can silently persist across builds. A reproducible build must not
+:: depend on whatever happened to be installed before.
+if exist .\venv (
+    echo [INFO] Removing existing '.\venv' for a clean, reproducible build...
+    rmdir /s /q .\venv
+)
+
+:: Build the venv with the verified py-launcher 3.13, not bare 'python'.
+%PY% -m venv .\venv
+if errorlevel 1 (
+    echo [ERROR] Failed to create virtual environment.
+    goto :error
 )
 
 :: 2. Activate Virtual Environment
-echo [STEP 2/4] Activating virtual environment...
+echo [STEP 2/5] Activating virtual environment...
 call .\venv\Scripts\activate.bat
 
 if not defined VIRTUAL_ENV (
@@ -94,7 +99,7 @@ if not defined VIRTUAL_ENV (
 )
 
 :: 3. Install Dependencies
-echo [STEP 3/4] Upgrading pip and installing pinned dependencies from requirements.txt...
+echo [STEP 3/5] Upgrading pip and installing pinned dependencies from requirements.txt...
 python -m pip install --upgrade pip > nul
 if errorlevel 1 (
     echo [ERROR] Failed to upgrade pip.
@@ -107,9 +112,55 @@ if errorlevel 1 (
     goto :error
 )
 
-:: 4. Build with PyInstaller using the project spec (onefile, windowed).
-echo [STEP 4/4] Building the onefile executable with PyInstaller...
-pyinstaller --clean --noconfirm pyburn_studio.spec
+:: 3b. Verify the burn-critical dependencies actually resolved to the versions
+::     the code depends on. The IMAPI2 audio burn imports IStream from a module
+::     whose location is comtypes-version-specific, so a wrong comtypes silently
+::     breaks burning at runtime. Fail the BUILD here instead of shipping an exe
+::     that cannot burn. Add any other version-sensitive checks to this block.
+echo [STEP 4/5] Verifying burn-critical dependencies...
+python -c "import comtypes; assert comtypes.__version__ == '1.4.13', 'comtypes ' + comtypes.__version__ + ' installed, need 1.4.13'; import comtypes.client; assert hasattr(comtypes.client, 'GetModule'), 'comtypes.client.GetModule missing (audio burn IStream generation would fail)'; import comtypes._post_coinit.unknwn; import PyQt6; print('[INFO] comtypes', comtypes.__version__, 'OK; GetModule present; _post_coinit present; PyQt6 OK')"
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Dependency verification failed. The installed packages do not
+    echo         match what the code requires, and a build would produce an exe
+    echo         that cannot burn. Check requirements.txt pins and re-run.
+    goto :error
+)
+
+:: 5. Build with PyInstaller on the command line (this is what the build uses;
+:: the .spec is not needed). --collect-all comtypes plus the _post_coinit
+:: hidden imports bundle comtypes in full so the frozen IMAPI2 audio burn can
+:: generate the COM IStream interface at runtime. --name pyburn_studio keeps the
+:: exe and any generated spec on the original pyburn_studio name.
+echo [STEP 5/5] Building the onefile executable with PyInstaller...
+pyinstaller -F --noupx --clean --noconfirm --windowed --name PyBurnStudio ^
+ --collect-all comtypes ^
+ --hidden-import comtypes.automation ^
+ --hidden-import comtypes._post_coinit ^
+ --hidden-import comtypes._post_coinit.unknwn ^
+ --hidden-import comtypes._post_coinit.misc ^
+ --collect-submodules pyburn ^
+ --hidden-import PyQt6.sip ^
+ --exclude-module PyQt6.Qt3DCore --exclude-module PyQt6.Qt3DRender ^
+ --exclude-module PyQt6.Qt3DInput --exclude-module PyQt6.Qt3DLogic ^
+ --exclude-module PyQt6.Qt3DAnimation --exclude-module PyQt6.Qt3DExtras ^
+ --exclude-module PyQt6.QtQml --exclude-module PyQt6.QtQuick ^
+ --exclude-module PyQt6.QtQuick3D --exclude-module PyQt6.QtQuickWidgets ^
+ --exclude-module PyQt6.QtWebEngineCore --exclude-module PyQt6.QtWebEngineWidgets ^
+ --exclude-module PyQt6.QtWebEngineQuick --exclude-module PyQt6.QtWebChannel ^
+ --exclude-module PyQt6.QtWebSockets --exclude-module PyQt6.QtWebView ^
+ --exclude-module PyQt6.QtSql --exclude-module PyQt6.QtTest ^
+ --exclude-module PyQt6.QtTextToSpeech --exclude-module PyQt6.QtBluetooth ^
+ --exclude-module PyQt6.QtNfc --exclude-module PyQt6.QtPositioning ^
+ --exclude-module PyQt6.QtMultimedia --exclude-module PyQt6.QtMultimediaWidgets ^
+ --exclude-module PyQt6.QtCharts --exclude-module PyQt6.QtDataVisualization ^
+ --exclude-module PyQt6.QtSensors --exclude-module PyQt6.QtSerialPort ^
+ --exclude-module PyQt6.QtDesigner --exclude-module PyQt6.QtHelp ^
+ --exclude-module PyQt6.QtPdf --exclude-module PyQt6.QtPdfWidgets ^
+ --exclude-module PyQt6.QtSvgWidgets ^
+ --exclude-module tkinter --exclude-module numpy --exclude-module PIL ^
+ --icon pyburn.ico --add-data "pyburn.ico;." --version-file version.txt ^
+ .\pyburn_studio.py
 if errorlevel 1 (
     echo [ERROR] PyInstaller build failed.
     goto :error

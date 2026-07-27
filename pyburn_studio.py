@@ -1,6 +1,20 @@
 from __future__ import annotations
 import sys
 import argparse
+
+# Frozen-build COM stability (mirrors the sibling audioctl app's compat shim).
+# comtypes uses internal _post_coinit modules to finalize COM types and provide
+# correct cleanup (__del__ -> Release()). In a PyInstaller onefile build these
+# can be missed by the bundler or first imported during interpreter shutdown,
+# which causes noisy or hard COM-cleanup crashes. Importing them here at startup
+# makes them visible to the bundler and avoids the late-import timing. Guarded so
+# non-Windows / source runs are unaffected.
+try:
+    import comtypes._post_coinit  # noqa: F401
+    import comtypes._post_coinit.unknwn  # noqa: F401
+except Exception:
+    pass
+
 from PyQt6.QtWidgets import QApplication, QMessageBox
 from pyburn.core.config import Config
 from pyburn.core.tools import ToolFinder
@@ -102,10 +116,160 @@ def self_test():
     return 0
 
 
+def cli_burn_data(args):
+    """One-shot data burn in a DEDICATED process, with REAL per-sector progress.
+
+    Two-stage, and neither stage overlaps a COM call with a disc write:
+      1) Build an ISO image file from the selected files/folders using IMAPI2
+         authoring (MsftFileSystemImage). This is COM, but it finishes BEFORE any
+         writing begins, so it cannot collide with a write.
+      2) Burn that ISO to the blank CD-R with SPTIWriter, which talks to the drive
+         directly via IOCTL_SCSI_PASS_THROUGH_DIRECT and raw MMC commands (NO COM,
+         NO IMAPI2). Because we issue every WRITE(10) ourselves, progress is exact
+         (sectors written / total) and nothing can overlap the write.
+
+    Stdout line protocol the parent GUI parses:
+        PROGRESS <int 0-100>
+        STATUS <text>
+        LOG <text>
+        RESULT OK
+        RESULT FAIL <text>
+    """
+    import sys as _sys
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    def emit(line):
+        try:
+            _sys.stdout.write(line + "\n")
+            _sys.stdout.flush()
+        except Exception:
+            pass
+
+    def on_status(s):
+        emit("STATUS " + str(s))
+
+    def on_progress(p):
+        try:
+            emit("PROGRESS " + str(int(p)))
+        except Exception:
+            pass
+
+    def on_log(m):
+        emit("LOG " + str(m))
+
+    # No COM at all: the ISO is authored in pure Python and the burn is pure
+    # SPTI/MMC. Nothing in this process touches IMAPI2 or comtypes.
+    iso_tmp = None
+    try:
+        from pyburn.services.iso_builder import ISOBuilder
+        from pyburn.services.spti_writer import SPTIWriter
+
+        files = [_Path(p) for p in args.file]
+        temp_dir = _Path(args.temp_dir) if args.temp_dir else _Path(_tempfile.gettempdir())
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        iso_tmp = temp_dir / ("pyburn_%d.iso" % (abs(hash(tuple(str(f) for f in files))) % 10_000_000))
+
+        # Stage 1: author the ISO in PURE PYTHON (no COM at all).
+        ISOBuilder().build(files, iso_tmp, args.volume, on_status, on_log)
+
+        # Convert the CD x-multiplier speed to kbytes/sec for SET CD SPEED.
+        # 1x CD = 176.4 kB/s (1000-byte kB per MMC). 0 = fastest.
+        speed_kbps = 0
+        try:
+            s = str(args.speed).strip().lower()
+            if s not in ("", "auto"):
+                speed_kbps = int(round(float(s) * 176))
+        except Exception:
+            speed_kbps = 0
+
+        # Stage 2: burn via SPTI/MMC (no COM), real per-sector progress.
+        writer = SPTIWriter()
+        writer.burn_iso(iso_tmp, args.device, on_status, on_progress, on_log,
+                        speed_kbps=speed_kbps, dummy=args.dummy, eject_after=args.eject)
+
+        emit("PROGRESS 100")
+        emit("RESULT OK")
+        return 0
+    except Exception as e:
+        emit("RESULT FAIL " + str(e))
+        return 1
+    finally:
+        # Clean up the temp ISO.
+        try:
+            if iso_tmp is not None and _Path(iso_tmp).exists():
+                _Path(iso_tmp).unlink()
+        except Exception:
+            pass
+
+
+
+def cli_burn_audio(args):
+    """One-shot audio CD burn in a DEDICATED process via SPTI CD-DA (no COM).
+
+    Inputs are already-decoded 44100/16-bit stereo WAV files (the GUI decodes
+    audio to WAV before calling, reusing its existing decode step). Burns them as
+    a gapless Red Book audio CD via SPTIWriter.burn_audio. Real per-sector
+    progress; nothing touches COM.
+    """
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    def emit(line):
+        try:
+            _sys.stdout.write(line + "\n")
+            _sys.stdout.flush()
+        except Exception:
+            pass
+
+    try:
+        from pyburn.services.spti_writer import SPTIWriter
+        wavs = [_Path(p) for p in args.file]
+        speed_kbps = 0
+        try:
+            s = str(args.speed).strip().lower()
+            if s not in ("", "auto"):
+                speed_kbps = int(round(float(s) * 176))
+        except Exception:
+            speed_kbps = 0
+        SPTIWriter().burn_audio(
+            wavs, args.device,
+            lambda st: emit("STATUS " + str(st)),
+            lambda p: emit("PROGRESS " + str(int(p))),
+            lambda m: emit("LOG " + str(m)),
+            speed_kbps=speed_kbps, dummy=args.dummy, eject_after=args.eject)
+        emit("PROGRESS 100")
+        emit("RESULT OK")
+        return 0
+    except Exception as e:
+        emit("RESULT FAIL " + str(e))
+        return 1
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PyBurn Studio")
     parser.add_argument("--self-test", action="store_true", help="Run built-in non-destructive self-tests")
+    sub = parser.add_subparsers(dest="cli_command")
+    p_bd = sub.add_parser("cli-burn-data", help=argparse.SUPPRESS)
+    p_bd.add_argument("--file", action="append", required=True, help="File or folder to add (repeatable)")
+    p_bd.add_argument("--device", required=True, help="Target drive, e.g. H:")
+    p_bd.add_argument("--volume", default="DATA_DISC", help="Volume label")
+    p_bd.add_argument("--temp-dir", default="", help="Temp directory")
+    p_bd.add_argument("--speed", default="Auto", help="Burn speed (Auto or x-multiplier)")
+    p_bd.add_argument("--auto-blank", action="store_true", help="Erase rewritable media if not blank")
+    p_bd.add_argument("--eject", action="store_true", help="Eject after burn")
+    p_bd.add_argument("--dummy", action="store_true", help="Simulate write (no disc written)")
+    p_ba = sub.add_parser("cli-burn-audio", help=argparse.SUPPRESS)
+    p_ba.add_argument("--file", action="append", required=True, help="WAV track (repeatable, in order)")
+    p_ba.add_argument("--device", required=True, help="Target drive, e.g. H:")
+    p_ba.add_argument("--speed", default="Auto", help="Burn speed (Auto or x-multiplier)")
+    p_ba.add_argument("--eject", action="store_true", help="Eject after burn")
+    p_ba.add_argument("--dummy", action="store_true", help="Simulate write (no disc written)")
     args = parser.parse_args()
     if args.self_test:
         sys.exit(self_test())
+    if args.cli_command == "cli-burn-data":
+        sys.exit(cli_burn_data(args))
+    if args.cli_command == "cli-burn-audio":
+        sys.exit(cli_burn_audio(args))
     run_gui()

@@ -37,6 +37,110 @@ def compute_total_size(paths: List[str], max_files: int = 50000) -> int:
     return total
 
 
+def _ffprobe_duration_seconds(ffprobe: str, path: str) -> float:
+    """Return the playback duration of one media file in seconds via ffprobe.
+
+    Audio CD capacity is measured in PLAYBACK TIME (about 80 minutes), not file
+    bytes. MP3/FLAC/etc. compress the audio, so their byte size is far smaller
+    than the uncompressed CD-audio they become, which made a bytes-based gauge
+    read far too low. Duration is the correct measure.
+    """
+    import subprocess
+    try:
+        creo: dict = {}
+        if os.name == "nt":
+            creoy = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            creo = {"creationflags": creoy}
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30, **creo,
+        )
+        val = (out.stdout or "").strip()
+        return float(val) if val else 0.0
+    except Exception:
+        return 0.0
+
+
+def compute_total_duration(paths: List[str], ffprobe: Optional[str]) -> float:
+    """Sum playback duration (seconds) across audio files using ffprobe.
+
+    Returns 0.0 if ffprobe is unavailable; the caller can fall back to a
+    conservative estimate in that case.
+    """
+    if not ffprobe:
+        return 0.0
+    total = 0.0
+    for p in paths:
+        pp = Path(p)
+        if pp.is_file():
+            total += _ffprobe_duration_seconds(ffprobe, str(pp))
+    return total
+
+
+# --- DVD-Video fit-to-disc bitrate model ------------------------------------
+# A single-layer DVD holds a fixed number of bits; how many MINUTES fit depends
+# on the video bitrate. Real DVD authoring picks a bitrate that fills the disc
+# for the given runtime (lower bitrate = longer runtime), rather than a fixed
+# rate. These constants and helpers are the single source of truth shared by
+# the capacity gauge (UI) and the WSL transcode (bitrate actually used).
+DVD5_USABLE_BYTES = 4_700_000_000   # single-layer DVD-5
+DVD_AUDIO_KBPS = 224                # MP2/AC3 DVD audio
+DVD_MUX_OVERHEAD = 0.98             # ~2% for VOB/nav-pack overhead
+DVD_VIDEO_MAX_KBPS = 9000           # headroom under the ~9.8 Mbps DVD ceiling
+DVD_VIDEO_MIN_KBPS = 2000           # quality floor; sets the practical max runtime
+
+
+def dvd_video_kbps_for_seconds(seconds: float) -> int:
+    """Video bitrate (kbps) that fills a DVD-5 for the given runtime, clamped
+    between the quality floor and the DVD ceiling."""
+    if seconds <= 0:
+        return DVD_VIDEO_MAX_KBPS
+    total_kbits = DVD5_USABLE_BYTES * 8 * DVD_MUX_OVERHEAD / 1000.0
+    avail_video_kbits = total_kbits - (DVD_AUDIO_KBPS * seconds)
+    kbps = avail_video_kbits / seconds if seconds > 0 else DVD_VIDEO_MAX_KBPS
+    return max(DVD_VIDEO_MIN_KBPS, min(DVD_VIDEO_MAX_KBPS, int(kbps)))
+
+
+def dvd_max_minutes() -> float:
+    """Runtime at which the video bitrate hits the quality floor. Past this, the
+    content will not fit a single-layer DVD at acceptable quality."""
+    total_kbits = DVD5_USABLE_BYTES * 8 * DVD_MUX_OVERHEAD / 1000.0
+    seconds = total_kbits / (DVD_VIDEO_MIN_KBPS + DVD_AUDIO_KBPS)
+    return seconds / 60.0
+
+
+# --- Blu-ray (BD-25) fit-to-disc bitrate model ------------------------------
+# Same idea as DVD, sized for a single-layer 25 GB Blu-ray with H.264 video and
+# AC3 audio. The BD path formerly used a fixed CRF (quality-based, so output
+# size varied with content and could not map to a time budget); switching to a
+# fit-to-disc bitrate makes capacity predictable and lets long content fit by
+# lowering the bitrate, exactly like the DVD path.
+BD25_USABLE_BYTES = 23_500_000_000   # usable BD-25 (~23.3 GiB), conservative
+BD_AUDIO_KBPS = 192                  # AC3 audio
+BD_MUX_OVERHEAD = 0.97               # BDMV/m2ts overhead
+BD_VIDEO_MAX_KBPS = 35000            # headroom under the ~40 Mbps BD ceiling
+BD_VIDEO_MIN_KBPS = 6000             # H.264 1080p quality floor; sets max runtime
+
+
+def bd_video_kbps_for_seconds(seconds: float) -> int:
+    """Video bitrate (kbps) that fills a BD-25 for the given runtime, clamped
+    between the quality floor and the BD ceiling."""
+    if seconds <= 0:
+        return BD_VIDEO_MAX_KBPS
+    total_kbits = BD25_USABLE_BYTES * 8 * BD_MUX_OVERHEAD / 1000.0
+    avail_video_kbits = total_kbits - (BD_AUDIO_KBPS * seconds)
+    kbps = avail_video_kbits / seconds if seconds > 0 else BD_VIDEO_MAX_KBPS
+    return max(BD_VIDEO_MIN_KBPS, min(BD_VIDEO_MAX_KBPS, int(kbps)))
+
+
+def bd_max_minutes() -> float:
+    """Runtime at which the BD video bitrate hits the quality floor."""
+    total_kbits = BD25_USABLE_BYTES * 8 * BD_MUX_OVERHEAD / 1000.0
+    seconds = total_kbits / (BD_VIDEO_MIN_KBPS + BD_AUDIO_KBPS)
+    return seconds / 60.0
+
+
 class FileListWidget(QListWidget):
     files_changed = pyqtSignal(list)
 
@@ -103,10 +207,15 @@ class FileListWidget(QListWidget):
 
 
 class CapacityGauge(QWidget):
-    def __init__(self, max_capacity_bytes: int):
+    def __init__(self, max_capacity_bytes: int, mode: str = "bytes", max_minutes: float = 80.0):
         super().__init__()
         self.max_capacity = max_capacity_bytes
         self.current_size = 0
+        # mode "bytes" -> data/video discs measured by size.
+        # mode "minutes" -> audio CD measured by playback time.
+        self.mode = mode
+        self.max_minutes = max_minutes
+        self.current_seconds = 0.0
         lay = QVBoxLayout(self)
         self.lbl = QLabel("")
         self.bar = QProgressBar()
@@ -114,7 +223,10 @@ class CapacityGauge(QWidget):
         self.bar.setTextVisible(True)
         lay.addWidget(self.lbl)
         lay.addWidget(self.bar)
-        self.update_size(0)
+        if self.mode == "minutes":
+            self.update_duration(0.0)
+        else:
+            self.update_size(0)
 
     def _human(self, n: int) -> str:
         units = ["B", "KB", "MB", "GB", "TB"]
@@ -125,6 +237,10 @@ class CapacityGauge(QWidget):
             i += 1
         return f"{v:.2f} {units[i]}"
 
+    def _fmt_mmss(self, seconds: float) -> str:
+        s = int(round(seconds))
+        return f"{s // 60}:{s % 60:02d}"
+
     def update_size(self, size_bytes: int):
         self.current_size = size_bytes
         pct = int((size_bytes / self.max_capacity) * 100) if self.max_capacity > 0 else 0
@@ -132,6 +248,24 @@ class CapacityGauge(QWidget):
         self.bar.setValue(pct)
         self.lbl.setText(f"{self._human(size_bytes)} / {self._human(self.max_capacity)} ({pct}%)")
         color = "#E74C3C" if size_bytes > self.max_capacity else "#2ECC71"
+        self.bar.setStyleSheet(f"""
+            QProgressBar {{ border: 1px solid #5e81ac; border-radius: 4px; background:#3b4252; color: white; }}
+            QProgressBar::chunk {{ background-color:{color}; }}
+        """)
+
+    def update_duration(self, seconds: float):
+        """Audio CD gauge: show total playback time against the disc's minutes."""
+        self.current_seconds = seconds
+        total_cap_seconds = self.max_minutes * 60.0
+        pct = int((seconds / total_cap_seconds) * 100) if total_cap_seconds > 0 else 0
+        pct = max(0, min(100, pct))
+        self.bar.setValue(pct)
+        over = seconds > total_cap_seconds
+        self.lbl.setText(
+            f"{self._fmt_mmss(seconds)} / {int(self.max_minutes)}:00 "
+            f"minutes ({pct}%)" + ("  OVER CAPACITY" if over else "")
+        )
+        color = "#E74C3C" if over else "#2ECC71"
         self.bar.setStyleSheet(f"""
             QProgressBar {{ border: 1px solid #5e81ac; border-radius: 4px; background:#3b4252; color: white; }}
             QProgressBar::chunk {{ background-color:{color}; }}

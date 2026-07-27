@@ -122,21 +122,224 @@ class BurnWorker(QObject):
 
     # ---- IMAPI2 path (Windows native) --------------------------------------
     def _run_imapi2(self):
+        # DATA burns run in a DEDICATED subprocess (see below). This keeps the
+        # exact working burn_data code, but moves progress OUT of COM entirely:
+        # the subprocess prints a percentage computed by a plain timer thread that
+        # never touches COM, so it cannot overlap Write() and corrupt the burn.
+        # Audio stays in-process (it already works via TrackAtOnce).
+        if self.job.job_type == JobType.DATA:
+            self._run_imapi2_data_subprocess()
+            return
+        if self.job.job_type == JobType.AUDIO:
+            self._run_spti_audio_subprocess()
+            return
+
         from .imapi2_backend import IMAPI2Backend
         o = self.job.options
-        self._backend = IMAPI2Backend()
-        if self.job.job_type == JobType.DATA:
-            self._backend.burn_data(self.job.files, self.job.device, o.temp_dir, o.volume_label,
-                                    self.sig_status.emit, self.sig_progress.emit, self.sig_log.emit,
-                                    auto_blank=o.auto_blank, eject_after=o.eject_after)
-            self.sig_finished.emit(True, "Data disc burned successfully (IMAPI2)")
-        elif self.job.job_type == JobType.AUDIO:
-            wavs = self._decode_audio_to_wav(self.job.files, o.temp_dir)
-            self._backend.burn_audio(wavs, self.job.device, self.sig_status.emit,
-                                     self.sig_progress.emit, self.sig_log.emit, eject_after=o.eject_after)
-            self.sig_finished.emit(True, "Audio CD created successfully (IMAPI2)")
+        # CRITICAL: this runs on a Qt worker thread. IMAPI2 (COM) must have a COM
+        # apartment on this thread. Plain CoInitialize() gives a Single-Threaded
+        # Apartment (STA), and IMAPI2's disc-master enumeration deadlocks in an
+        # STA that has no Windows message pump (a worker thread has none): the
+        # first enumeration call blocks forever. Initialize a MULTI-THREADED
+        # apartment (MTA) instead, which does not require a message pump.
+        _com_ready = False
+        try:
+            import comtypes
+            try:
+                comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+            except Exception:
+                import ctypes
+                ctypes.windll.ole32.CoInitializeEx(None, 0x0)
+            _com_ready = True
+            self.sig_log.emit("COM initialized (MTA) on burn worker thread")
+        except Exception as e:
+            self.sig_log.emit(f"COM init (MTA) warning: {e}")
+        try:
+            self.sig_log.emit("Creating IMAPI2 backend...")
+            self._backend = IMAPI2Backend()
+            if self.job.job_type == JobType.AUDIO:
+                self.sig_log.emit("Decoding audio to WAV...")
+                wavs = self._decode_audio_to_wav(self.job.files, o.temp_dir)
+                self.sig_log.emit(f"Decoded {len(wavs)} tracks; dispatching to burn_audio (IMAPI2)...")
+                self._backend.burn_audio(wavs, self.job.device, self.sig_status.emit,
+                                         self.sig_progress.emit, self.sig_log.emit,
+                                         eject_after=o.eject_after, speed=o.speed)
+                self.sig_finished.emit(True, "Audio CD created successfully (IMAPI2)")
+            else:
+                self.sig_finished.emit(False, f"IMAPI2 does not handle {self.job.job_type.value}")
+        finally:
+            if _com_ready:
+                try:
+                    import comtypes
+                    comtypes.CoUninitialize()
+                except Exception:
+                    pass
+
+    def _run_imapi2_data_subprocess(self):
+        """Burn a data disc via a one-shot CLI subprocess (this same exe).
+
+        The child owns COM for the burn and runs the exact working burn_data. It
+        streams PROGRESS/STATUS/LOG/RESULT on stdout; the percentage is produced
+        by a plain timer thread in the child that makes no COM calls, so burn
+        integrity is fully decoupled from progress. The GUI never touches comtypes
+        for the data burn.
+        """
+        import sys as _sys
+        import subprocess
+        o = self.job.options
+
+        if getattr(_sys, "frozen", False):
+            cmd = [_sys.executable, "cli-burn-data"]
         else:
-            self.sig_finished.emit(False, f"IMAPI2 does not handle {self.job.job_type.value}")
+            import os
+            script = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))), "pyburn_studio.py")
+            cmd = [_sys.executable, script, "cli-burn-data"]
+        for f in self.job.files:
+            cmd += ["--file", str(f)]
+        cmd += ["--device", str(self.job.device),
+                "--volume", str(o.volume_label or "DATA_DISC"),
+                "--temp-dir", str(o.temp_dir),
+                "--speed", str(o.speed or "Auto")]
+        if o.auto_blank:
+            cmd += ["--auto-blank"]
+        if o.eject_after:
+            cmd += ["--eject"]
+        if getattr(o, "dummy", False):
+            cmd += ["--dummy"]
+
+        self.sig_log.emit("Launching isolated burn process (cli-burn-data)...")
+        creationflags = 0
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW
+        except Exception:
+            creationflags = 0x08000000
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, creationflags=creationflags,
+            )
+        except Exception as e:
+            self.sig_finished.emit(False, f"Could not start burn process: {e}")
+            return
+
+        self._burn_proc = proc
+        result_ok = None
+        result_msg = "Data disc burned successfully (IMAPI2)"
+        try:
+            for raw in proc.stdout:
+                line = raw.rstrip("\r\n")
+                if not line:
+                    continue
+                if line.startswith("PROGRESS "):
+                    try:
+                        self.sig_progress.emit(int(line[9:].strip()))
+                    except Exception:
+                        pass
+                elif line.startswith("STATUS "):
+                    self.sig_status.emit(line[7:])
+                elif line.startswith("LOG "):
+                    self.sig_log.emit(line[4:])
+                elif line.startswith("RESULT OK"):
+                    result_ok = True
+                elif line.startswith("RESULT FAIL"):
+                    result_ok = False
+                    msg = line[len("RESULT FAIL"):].strip()
+                    if msg:
+                        result_msg = msg
+                else:
+                    self.sig_log.emit(line)
+        except Exception as e:
+            self.sig_log.emit(f"Error reading burn process output: {e}")
+        rc = proc.wait()
+        if result_ok is None:
+            result_ok = (rc == 0)
+            if not result_ok:
+                result_msg = f"Burn process exited with code {rc}"
+        self.sig_finished.emit(bool(result_ok), result_msg)
+
+    def _cli_base_cmd(self, subcommand: str):
+        """Build the [exe, subcommand] prefix to re-invoke ourselves."""
+        import sys as _sys
+        if getattr(_sys, "frozen", False):
+            return [_sys.executable, subcommand]
+        import os
+        script = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), "pyburn_studio.py")
+        return [_sys.executable, script, subcommand]
+
+    def _pump_burn_subprocess(self, cmd, ok_msg: str):
+        """Launch cmd, translate its PROGRESS/STATUS/LOG/RESULT stdout into
+        signals, and emit sig_finished. Shared by data and audio burns."""
+        import subprocess
+        self.sig_log.emit(f"Launching isolated burn process ({cmd[1] if len(cmd) > 1 else '?'})...")
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW
+        except Exception:
+            creationflags = 0x08000000
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, creationflags=creationflags,
+            )
+        except Exception as e:
+            self.sig_finished.emit(False, f"Could not start burn process: {e}")
+            return
+        self._burn_proc = proc
+        result_ok = None
+        result_msg = ok_msg
+        try:
+            for raw in proc.stdout:
+                line = raw.rstrip("\r\n")
+                if not line:
+                    continue
+                if line.startswith("PROGRESS "):
+                    try:
+                        self.sig_progress.emit(int(line[9:].strip()))
+                    except Exception:
+                        pass
+                elif line.startswith("STATUS "):
+                    self.sig_status.emit(line[7:])
+                elif line.startswith("LOG "):
+                    self.sig_log.emit(line[4:])
+                elif line.startswith("RESULT OK"):
+                    result_ok = True
+                elif line.startswith("RESULT FAIL"):
+                    result_ok = False
+                    msg = line[len("RESULT FAIL"):].strip()
+                    if msg:
+                        result_msg = msg
+                else:
+                    self.sig_log.emit(line)
+        except Exception as e:
+            self.sig_log.emit(f"Error reading burn process output: {e}")
+        rc = proc.wait()
+        if result_ok is None:
+            result_ok = (rc == 0)
+            if not result_ok:
+                result_msg = f"Burn process exited with code {rc}"
+        self.sig_finished.emit(bool(result_ok), result_msg)
+
+    def _run_spti_audio_subprocess(self):
+        """Decode inputs to WAV, then burn a CD-DA audio disc via the SPTI
+        subprocess (cli-burn-audio). No COM anywhere."""
+        o = self.job.options
+        try:
+            self.sig_status.emit("Decoding audio to WAV...")
+            wavs = self._decode_audio_to_wav(self.job.files, o.temp_dir)
+            self.sig_log.emit(f"Decoded {len(wavs)} tracks; launching SPTI audio burn...")
+        except Exception as e:
+            self.sig_finished.emit(False, f"Audio decode failed: {e}")
+            return
+        cmd = self._cli_base_cmd("cli-burn-audio")
+        for w in wavs:
+            cmd += ["--file", str(w)]
+        cmd += ["--device", str(self.job.device), "--speed", str(o.speed or "Auto")]
+        if o.eject_after:
+            cmd += ["--eject"]
+        if getattr(o, "dummy", False):
+            cmd += ["--dummy"]
+        self._pump_burn_subprocess(cmd, "Audio CD created successfully (SPTI/MMC)")
 
     def _decode_audio_to_wav(self, files, temp_dir: Path):
         # IMAPI2 audio wants 44100/16/stereo WAV. Use native ffmpeg if present,
@@ -151,8 +354,16 @@ class BurnWorker(QObject):
             if ffmpeg:
                 import subprocess
                 self.sig_status.emit(f"Decoding track {idx}/{len(files)} (ffmpeg)...")
-                subprocess.run([ffmpeg, "-y", "-i", str(src), "-ar", "44100", "-ac", "2",
-                                "-sample_fmt", "s16", str(target)], capture_output=True, text=True)
+                # -map_metadata -1 drops the source MP3 tags so ffmpeg does not
+                # write a LIST/INFO chunk into the WAV. -rf64 never and an
+                # explicit pcm_s16le codec keep it a plain 44100/16/stereo PCM
+                # WAV, which is what the audio CD path expects. -bitexact avoids
+                # ffmpeg writing its own encoder-info metadata chunk.
+                subprocess.run([ffmpeg, "-y", "-i", str(src),
+                                "-map_metadata", "-1", "-bitexact",
+                                "-ar", "44100", "-ac", "2",
+                                "-c:a", "pcm_s16le", "-sample_fmt", "s16",
+                                str(target)], capture_output=True, text=True)
                 wavs.append(target)
             else:
                 # No encoder: only usable if the input already is WAV.
@@ -161,7 +372,7 @@ class BurnWorker(QObject):
                     wavs.append(target)
                 else:
                     raise RuntimeError("No ffmpeg available to decode audio; provide WAV files or install ffmpeg")
-            self.sig_progress.emit(int((idx / max(1, len(files))) * 40))
+            self.sig_progress.emit(int((idx / max(1, len(files))) * 100))
         return wavs
 
     # ---- IOCTL rip path (Windows native) -----------------------------------
@@ -180,20 +391,43 @@ class BurnWorker(QObject):
     def _run_wsl_author(self):
         from .wsl_backend import WSLAuthorBackend
         o = self.job.options
-        self._backend = WSLAuthorBackend(self.resolver.wsl)
-        if self.job.job_type == JobType.VIDEO_DVD:
-            self._backend.burn_video_dvd(self.job.files, self.job.device, self.sig_status.emit,
-                                        self.sig_progress.emit, self.sig_log.emit,
-                                        auto_blank=o.auto_blank, eject_after=o.eject_after)
-            self.sig_finished.emit(True, "Video DVD created successfully (WSL2 author + IMAPI2 burn)")
-        elif self.job.job_type == JobType.VIDEO_BD:
-            self._backend.burn_video_bd(self.job.files, self.job.device, self.sig_status.emit,
-                                       self.sig_progress.emit, self.sig_log.emit,
-                                       auto_blank=o.auto_blank, eject_after=o.eject_after)
-            self.sig_finished.emit(True, "Blu-ray created successfully (WSL2 author + IMAPI2 burn)")
-        else:
-            self.sig_finished.emit(False, f"WSL path does not handle {self.job.job_type.value}")
+        # The burn half of this path uses IMAPI2 (COM) on this worker thread, so
+        # the COM apartment must be initialized here too (see _run_imapi2).
+        _com_ready = False
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+            _com_ready = True
+        except Exception as e:
+            self.sig_log.emit(f"COM init warning: {e}")
+        try:
+            self._backend = WSLAuthorBackend(self.resolver.wsl)
+            if self.job.job_type == JobType.VIDEO_DVD:
+                self._backend.burn_video_dvd(self.job.files, self.job.device, self.sig_status.emit,
+                                            self.sig_progress.emit, self.sig_log.emit,
+                                            auto_blank=o.auto_blank, eject_after=o.eject_after)
+                self.sig_finished.emit(True, "Video DVD created successfully (WSL2 author + IMAPI2 burn)")
+            elif self.job.job_type == JobType.VIDEO_BD:
+                self._backend.burn_video_bd(self.job.files, self.job.device, self.sig_status.emit,
+                                           self.sig_progress.emit, self.sig_log.emit,
+                                           auto_blank=o.auto_blank, eject_after=o.eject_after)
+                self.sig_finished.emit(True, "Blu-ray created successfully (WSL2 author + IMAPI2 burn)")
+            else:
+                self.sig_finished.emit(False, f"WSL path does not handle {self.job.job_type.value}")
+        finally:
+            if _com_ready:
+                try:
+                    import comtypes
+                    comtypes.CoUninitialize()
+                except Exception:
+                    pass
 
     def cancel(self):
+        proc = getattr(self, "_burn_proc", None)
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
         if self._backend is not None and hasattr(self._backend, "cancel"):
             self._backend.cancel()
