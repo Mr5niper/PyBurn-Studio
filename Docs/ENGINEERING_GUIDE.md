@@ -65,12 +65,21 @@ Services (`pyburn/services/`), where the work happens:
   per job type and platform, which engine handles the job and reports why.
   WSLManager detects WSL2, installs a distro, provisions the Linux tools, runs
   commands inside the distro, and translates Windows paths to /mnt form.
-- `imapi2_backend.py` is the native Windows burning backend (data, ISO, audio,
-  blank, eject) via comtypes. No external tools.
+- `imapi2_backend.py` is the Windows IMAPI2 backend via comtypes, now used for
+  media introspection, blanking, and eject (and kept as an audio fallback). The
+  data and audio writes no longer go through it.
+- `spti_writer.py` is the native Windows write engine. It opens the drive with
+  DeviceIoControl and sends raw MMC commands over IOCTL_SCSI_PASS_THROUGH_DIRECT
+  to burn data CDs (Track-At-Once) and audio CDs (gapless Session-At-Once with a
+  cue sheet), issuing every WRITE(10) itself so progress is exact and no COM is
+  in the write path. It performs OPC (laser power calibration) before writing.
+- `iso_builder.py` authors an ISO9660 + Joliet data image in pure Python (shared
+  file extents for both directory trees), replacing IMAPI2 image authoring for
+  the data burn. No COM, no external tools.
 - `ioctl_ripper.py` is the native Windows CD ripper via DeviceIoControl, with
   ffmpeg encoding when present.
 - `wsl_backend.py` authors DVD (dvdauthor) and Blu-ray (tsMuxeR) images inside
-  WSL2 and hands the finished image to IMAPI2 to burn.
+  WSL2 and hands the finished image to the native SPTI engine to burn.
 - `installer.py` downloads ffmpeg into a local tools folder, runs the elevated
   WSL2 install, and fetches tsMuxeR into the distro.
 - `queue.py` (JobQueueService) owns the single-job-at-a-time queue and the
@@ -88,10 +97,12 @@ Services (`pyburn/services/`), where the work happens:
 Per-platform engine routing (the heart of the cross-platform design):
 - Linux and macOS: every job runs through the CLI backend (backend.py), exactly
   as before. Nothing about the Linux path changed.
-- Windows: data disc, audio CD, blank, media info, and eject run through IMAPI2;
-  ripping runs through IOCTL; Video DVD and Blu-ray author inside WSL2 and are
-  then burned by IMAPI2. If a native Windows CLI tool build happens to be
-  present it is preferred, otherwise the native API path is used.
+- Windows: media info, blank, and eject run through IMAPI2; data disc and audio
+  CD writes run through the native SPTI/MMC engine (spti_writer.py) in a dedicated
+  subprocess, with data images authored in pure Python (iso_builder.py); ripping
+  runs through IOCTL; Video DVD and Blu-ray author inside WSL2 and are then burned
+  by the SPTI engine. If a native Windows CLI tool build happens to be present it
+  is preferred, otherwise the native path is used.
 - When no path exists for a job on the current machine (for example DVD/BD with
   no WSL2), the resolver returns NONE and the worker fails the job with a clear
   message instead of pretending to succeed.

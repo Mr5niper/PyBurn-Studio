@@ -4,18 +4,21 @@ PyBurn Studio is a desktop disc authoring application built with Python and
 PyQt6. It burns and rips discs on both Linux and Windows, choosing the right
 engine for each job automatically. On Linux it drives the standard command-line
 disc tools (mkisofs/genisoimage, cdrecord/wodim, growisofs, cdrdao, ffmpeg,
-dvdauthor, cdparanoia, and friends). On Windows it uses the built-in Windows
-burning and CD-reading APIs for most jobs and a WSL2 Linux environment only for
-the DVD and Blu-ray authoring steps that have no Windows equivalent. It shows
-real progress, a job queue, verification, and history.
+dvdauthor, cdparanoia, and friends). On Windows it burns and reads discs with
+its own built-in engine that talks to the drive directly (SPTI/MMC for writing,
+IOCTL for reading), with no external tools, and uses a WSL2 Linux environment
+only for the DVD and Blu-ray authoring steps that have no Windows equivalent. It
+shows real progress, a job queue, verification, and history.
 
 ## What it does
 
 - Burn data discs (CD, DVD, Blu-ray) from files and folders. On Linux an ISO is
   built by mkisofs and written by growisofs or cdrecord; on Windows the built-in
-  IMAPI2 engine builds and writes the disc with no external tools.
+  engine builds an ISO9660/Joliet image in pure Python and writes it to the
+  drive directly with SPTI/MMC commands, with no external tools.
 - Author audio CDs from MP3/WAV/FLAC/OGG/M4A/AAC. On Linux via cdrdao with
-  optional CD-Text; on Windows via IMAPI2 with ffmpeg decoding the tracks.
+  optional CD-Text; on Windows via the built-in SPTI/MMC engine (gapless
+  Disc-At-Once Red Book audio) with ffmpeg decoding the tracks.
 - Author video DVDs (transcode with ffmpeg, structure with dvdauthor) and
   Blu-ray BDMV discs (requires tsMuxeR).
 - Rip audio CDs to MP3, FLAC, or WAV, with optional MusicBrainz metadata lookup.
@@ -70,14 +73,16 @@ brew install cdrtools dvd+rw-tools ffmpeg cdrdao cdparanoia \
 ```
 
 Windows: most jobs need no external tools at all. Data discs, ISO burning, audio
-CDs, blanking, media info, eject, and CD ripping run through the built-in
-Windows engines (IMAPI2 and IOCTL). ffmpeg is the only helper worth adding, and
-the app can download an official build for you from the Setup screen. Video DVD
-and Blu-ray authoring use a WSL2 Linux environment for the authoring step and
-then burn the result with the native Windows burner; the Setup screen installs
-WSL2 and the needed Linux tools for you (one Windows approval and one reboot are
-required, which Windows mandates for any feature install). See the Platform
-notes section below.
+CDs, blanking, media info, eject, and CD ripping run through the built-in Windows
+engine: writing goes directly to the drive with SPTI/MMC commands (data and audio
+both burn this way, with an ISO9660/Joliet image built in pure Python for data),
+and reading uses IOCTL. ffmpeg is the only helper worth adding, and the app can
+download an official build for you from the Setup screen. Video DVD and Blu-ray
+authoring use a WSL2 Linux environment for the authoring step and then burn the
+result with the native Windows burner; the Setup screen installs WSL2 and the
+needed Linux tools for you (one Windows approval and one reboot are required,
+which Windows mandates for any feature install). See the Platform notes section
+below.
 
 ## Running from source
 
@@ -141,17 +146,18 @@ manual PowerShell steps, are in `Docs/BUILD_EXE.md`.
 - macOS works with the tools installed through Homebrew. Device paths differ
   (for example `/dev/disk2`).
 - Windows is a first-class platform. Data discs, ISO, audio CD, blanking, media
-  info, eject, and ripping run natively through the built-in Windows engines
-  (IMAPI2 for burning, IOCTL for reading), with no external tools. Video DVD and
-  Blu-ray authoring run inside a WSL2 Linux environment and are then burned by
-  the native Windows burner. The Setup screen reports what each feature can do,
-  can download ffmpeg into a local tools folder, and can install WSL2 and its
-  Linux tools for you. Installing WSL2 requires one Windows elevation approval
-  and one reboot; everything else is automatic. If setup fails, the app writes a
-  full log to pyburn_setup.log next to the program. The Windows build detects
-  optical drives with a PowerShell CIM query (Win32_CDROMDrive) and falls back
-  to the older WMIC only if that fails, because WMIC was removed from Windows 11
-  24H2.
+  info, eject, and ripping run natively through the built-in Windows engine, with
+  no external tools: writing goes straight to the drive using SPTI/MMC commands
+  (for data, an ISO9660/Joliet image is built in pure Python first; audio is
+  burned gapless in Disc-At-Once mode), and reading uses IOCTL. Video DVD and
+  Blu-ray authoring run inside a WSL2 Linux environment and are then burned by the
+  native Windows burner. The Setup screen reports what each feature can do, can
+  download ffmpeg into a local tools folder, and can install WSL2 and its Linux
+  tools for you. Installing WSL2 requires one Windows elevation approval and one
+  reboot; everything else is automatic. If setup fails, the app writes a full log
+  to pyburn_setup.log next to the program. The Windows build detects optical
+  drives with a PowerShell CIM query (Win32_CDROMDrive) and falls back to the
+  older WMIC only if that fails, because WMIC was removed from Windows 11 24H2.
 
 ## License
 

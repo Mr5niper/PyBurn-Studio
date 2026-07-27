@@ -418,7 +418,7 @@ class CapabilityResolver:
         if self._native("mkisofs") and (self._native("growisofs") or self._native("cdrecord")):
             return Capability(Engine.CLI, True, "native Windows cdrtools build")
         if self._imapi2_ok():
-            return Capability(Engine.IMAPI2, True, "Windows IMAPI2")
+            return Capability(Engine.IMAPI2, True, "native SPTI/MMC burn (built-in Windows, no tools)")
         return Capability(Engine.SIM, False, "no burn engine")
 
     def resolve_audio(self) -> Capability:
@@ -426,13 +426,13 @@ class CapabilityResolver:
             if self._native("ffmpeg") and self._native("cdrdao"):
                 return Capability(Engine.CLI, True, "ffmpeg + cdrdao")
             return Capability(Engine.SIM, False, "missing ffmpeg/cdrdao")
-        # Windows: decode with native ffmpeg (or WSL ffmpeg), burn tracks via IMAPI2.
+        # Windows: decode with native ffmpeg (or WSL ffmpeg), burn CD-DA via SPTI.
         has_ffmpeg = self._native("ffmpeg") or self._wsl_has("ffmpeg")
         if has_ffmpeg and self._imapi2_ok():
             src = "native ffmpeg" if self._native("ffmpeg") else "WSL2 ffmpeg"
-            return Capability(Engine.IMAPI2, True, f"{src} decode + IMAPI2 audio burn")
+            return Capability(Engine.IMAPI2, True, f"{src} decode + native SPTI/MMC CD-DA burn")
         if self._imapi2_ok():
-            return Capability(Engine.IMAPI2, True, "IMAPI2 audio burn (ffmpeg missing; WAV input only)")
+            return Capability(Engine.IMAPI2, True, "native SPTI/MMC CD-DA burn (ffmpeg missing; WAV input only)")
         return Capability(Engine.SIM, False, "no audio burn engine")
 
     def resolve_video_dvd(self) -> Capability:
@@ -442,7 +442,7 @@ class CapabilityResolver:
             return Capability(Engine.SIM, False, "missing ffmpeg/dvdauthor/mkisofs")
         # Windows: author in WSL2 (dvdauthor has no Windows build), burn ISO via IMAPI2.
         if self._wsl_has("dvdauthor") and (self._wsl_has("mkisofs")) and (self._wsl_has("ffmpeg") or self._native("ffmpeg")) and self._imapi2_ok():
-            return Capability(Engine.WSL, True, "WSL2 authors VIDEO_TS/ISO, IMAPI2 burns")
+            return Capability(Engine.WSL, True, "WSL2 authors VIDEO_TS/ISO, native SPTI burns")
         return Capability(Engine.NONE, False, "needs WSL2 with dvdauthor+mkisofs+ffmpeg")
 
     def resolve_video_bd(self) -> Capability:
@@ -452,7 +452,7 @@ class CapabilityResolver:
             return Capability(Engine.SIM, False, "missing ffmpeg/tsMuxeR/mkisofs")
         # Windows: author BDMV in WSL2, burn UDF image via IMAPI2.
         if self._wsl_has("tsMuxeR") and (self._wsl_has("xorriso") or self._wsl_has("mkisofs")) and (self._wsl_has("ffmpeg") or self._native("ffmpeg")) and self._imapi2_ok():
-            return Capability(Engine.WSL, True, "WSL2 authors BDMV/UDF, IMAPI2 burns")
+            return Capability(Engine.WSL, True, "WSL2 authors BDMV/UDF, native SPTI burns")
         return Capability(Engine.NONE, False, "needs WSL2 with tsMuxeR+xorriso+ffmpeg")
 
     def resolve_rip(self) -> Capability:

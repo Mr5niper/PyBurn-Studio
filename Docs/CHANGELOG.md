@@ -1,5 +1,72 @@
 # PyBurn Studio - Changelog
 
+## [1.15.0] - 2026 - Native SPTI/MMC burn engine on Windows
+
+Windows disc burning was rewritten to talk to the drive directly instead of
+going through the IMAPI2 COM API. IMAPI2's progress-event model corrupted burns
+on some USB drives (the progress callback fires inside the synchronous write and
+the drive rejects it), and there was no safe way to get live progress from it on
+that hardware. The burn now issues the low-level drive commands itself, the same
+way the ripper already reads discs, so every write is under the app's control,
+progress is exact, and there is no COM in the write path to interfere with it.
+
+### Added
+- Native SPTI/MMC write engine (pyburn/services/spti_writer.py). It opens the
+  drive directly and sends raw MMC commands over IOCTL_SCSI_PASS_THROUGH_DIRECT,
+  following the standard command sequence (GET CONFIGURATION, READ DISC
+  INFORMATION, MODE SELECT write parameters, READ TRACK INFORMATION, a WRITE(10)
+  loop, SYNCHRONIZE CACHE, CLOSE TRACK SESSION). Because the app issues every
+  write, progress is exact (sectors written / total) with no events, no polling,
+  and nothing that can overlap the write.
+- Data CDs burn in Track-At-Once mode; audio CDs burn gapless in Session-At-Once
+  (Disc-At-Once) mode with a cue sheet, raw 2352-byte CD-DA sectors, and the
+  mandatory pre-gap, matching Red Book audio.
+- Optimal Power Calibration (OPC) is performed before the first write on both the
+  data and audio paths, as mature burners do. Skipping it let a write start on
+  default laser power and then fail partway through with a medium/write error;
+  running it first makes the write reliable.
+- Pure-Python ISO9660 + Joliet image builder (pyburn/services/iso_builder.py).
+  Data images are now authored in the app with no COM and no external tools:
+  both an ISO9660 (8.3) and a Joliet (long-name, UCS-2) directory tree sharing
+  the same file extents, verified against a standard ISO parser across empty,
+  single-sector, multi-sector, large, and deeply nested files.
+
+### Changed
+- Windows data and audio burns run in a dedicated one-shot subprocess (the app
+  re-invoked with a hidden CLI command), so the actual burn is completely
+  isolated from the GUI process. Progress, status, and log lines stream back over
+  stdout. This is the same isolation pattern the sibling audio-control tool uses
+  for COM work, applied here so nothing in the GUI can perturb a burn in flight.
+- The Setup screen and the About/readiness report now name the real engines:
+  "native SPTI/MMC burn" for data and audio, and "WSL2 authors, native SPTI
+  burns" for Video DVD and Blu-ray, instead of IMAPI2. The first-run guidance is
+  explicit that nothing needs to be installed to burn or rip, that ffmpeg is an
+  optional download for better audio decode and rip encoding, and that WSL2 is
+  needed only for Video DVD and Blu-ray.
+
+### Fixed
+- Data burns no longer corrupt on drives where IMAPI2's write-progress events
+  interfered with the synchronous write; the SPTI engine removes that failure
+  mode entirely.
+- Audio decode progress reached only 40 percent regardless of the number of
+  tracks (a leftover scaling factor). Decoding now fills its own 0-100 bar, and
+  the burn then runs its own 0-100 bar.
+- The audio write loop no longer reports progress on every single WRITE(10); it
+  reports on a short time gate so a slow progress consumer cannot stall the write
+  stream and starve the drive buffer.
+
+### Dependencies and setup
+- No new dependencies. The SPTI engine and ISO builder use only the Python
+  standard library and the Windows API through ctypes. The pinned build
+  requirements and the build recipe are unchanged. comtypes remains a dependency
+  because IMAPI2 is still used for Windows media introspection, blanking, and
+  eject, and as an audio fallback.
+- Nothing new to install for a first-time setup. Burning and ripping work out of
+  the box; ffmpeg (optional) and WSL2 for DVD/Blu-ray (optional) are installed
+  from the Setup screen as before.
+
+---
+
 ## [1.9.0] - 2025 - Cross-platform engine architecture (Windows native + WSL2)
 
 PyBurn now runs as a first-class Windows application as well as Linux, instead
