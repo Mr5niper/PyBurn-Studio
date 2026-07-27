@@ -372,7 +372,7 @@ class BurnWorker(QObject):
                     wavs.append(target)
                 else:
                     raise RuntimeError("No ffmpeg available to decode audio; provide WAV files or install ffmpeg")
-            self.sig_progress.emit(int((idx / max(1, len(files))) * 40))
+            self.sig_progress.emit(int((idx / max(1, len(files))) * 100))
         return wavs
 
     # ---- IOCTL rip path (Windows native) -----------------------------------
