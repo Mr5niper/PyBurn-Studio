@@ -329,6 +329,273 @@ class SPTIWriter:
             on_log(f"spti: CLOSE TRACK SESSION (fn {close_function}) failed ({self._sense_str(sense)})")
         return ok
 
+    # -- public: burn audio tracks (CD-DA) to a blank CD-R ---------------------
+    def burn_audio(self, wav_files: List[Path], device: str,
+                   on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
+                   speed_kbps: int = 0, dummy: bool = False,
+                   eject_after: bool = True) -> None:
+        """Burn Red Book audio (CD-DA) from 44100/16-bit stereo WAV files.
+
+        Uses Session-At-Once (SAO / Disc-At-Once) via a SEND CUE SHEET, which is
+        cdrecord's '-dao -audio' approach and the right way to get a gapless,
+        standards-compliant audio CD (TAO inserts a 2-second gap between tracks).
+        Audio is written as raw 2352-byte CD-DA sectors (588 stereo 16-bit frames
+        per sector). We issue every WRITE(10) ourselves, so progress is exact.
+        """
+        import wave
+
+        AUDIO_SECTOR = 2352
+
+        # 1) Read every WAV into raw 44100/16/stereo PCM and measure in sectors.
+        tracks = []
+        for wf in wav_files:
+            with wave.open(str(wf), "rb") as w:
+                ch = w.getnchannels()
+                sw = w.getsampwidth()
+                fr = w.getframerate()
+                frames = w.readframes(w.getnframes())
+            if ch != 2 or sw != 2 or fr != 44100:
+                raise RuntimeError(f"{Path(wf).name} is not 44100 Hz 16-bit stereo; "
+                                   f"got {fr} Hz {sw*8}-bit {ch}ch. Convert first.")
+            rem = len(frames) % AUDIO_SECTOR
+            if rem:
+                frames = frames + b"\x00" * (AUDIO_SECTOR - rem)
+            sectors = len(frames) // AUDIO_SECTOR
+            tracks.append({"pcm": frames, "sectors": sectors})
+        if not tracks:
+            raise RuntimeError("No audio tracks to burn.")
+
+        lba = 0
+        for t in tracks:
+            t["start_lba"] = lba
+            lba += t["sectors"]
+        total_sectors = lba
+        leadout_lba = total_sectors
+
+        on_log(f"spti-audio: {len(tracks)} tracks, {total_sectors} sectors "
+               f"({total_sectors/75.0:.1f} s)")
+
+        handle = self._open_drive(device)
+        try:
+            self._lock_volume(handle, on_log)
+
+            on_status("Checking media (SPTI/MMC audio)...")
+            profile = self._get_configuration(handle, on_log)
+            if profile is not None and profile not in (0x09, 0x0A):
+                raise RuntimeError(f"Media is not CD-R/CD-RW (profile 0x{profile:04X}).")
+            disc_status = self._read_disc_information(handle, on_log)
+            if disc_status == 2:
+                raise RuntimeError("Disc is finalized; use a blank CD-R.")
+
+            self._set_cd_speed(handle, speed_kbps, on_log)
+
+            on_status("Setting audio write parameters (SPTI/MMC)...")
+            if not self._mode_select_audio_sao(handle, on_log, dummy=dummy):
+                raise RuntimeError("Drive rejected the audio write parameters.")
+
+            # Calibrate laser power for this disc BEFORE writing (as cdrecord's
+            # "Performing OPC..." does). Skipping this is a prime cause of a
+            # write that starts fine then fails partway with sense 03/0C.
+            on_status("Calibrating laser power (OPC)...")
+            self._perform_opc(handle, on_log)
+
+            cue = self._build_audio_cue_sheet(tracks, leadout_lba)
+            if not self._send_cue_sheet(handle, cue, on_log):
+                raise RuntimeError("Drive rejected the cue sheet (SEND CUE SHEET).")
+
+            on_status("Burning audio CD (SPTI/MMC)..." + (" [TEST]" if dummy else ""))
+            written = 0
+            # The mandatory 2-second pre-gap before track 1 must be physically
+            # written as 150 blocks of silence, starting at LBA -150, so the LBA
+            # increases from -150 to 0 (cookbook lines 433-435). The cue sheet
+            # already declares this pre-gap; if we do not write these blocks the
+            # drive's expected layout and the actual writes disagree.
+            silence = bytearray(AUDIO_SECTOR * SECTORS_PER_WRITE)
+            lba = -150
+            remaining_pregap = 150
+            while remaining_pregap > 0:
+                n = min(SECTORS_PER_WRITE, remaining_pregap)
+                blk = bytes(silence[:AUDIO_SECTOR * n])
+                if not self._write10_audio(handle, lba, n, bytearray(blk), on_log):
+                    raise RuntimeError(f"Audio pre-gap write failed at sector {lba}.")
+                lba += n
+                remaining_pregap -= n
+            # Now lba == 0; write the track payload contiguously (no gaps between
+            # tracks in a pure-audio SAO session, cookbook line 443).
+            #
+            # IMPORTANT: do NOT report progress on every WRITE(10). on_progress
+            # writes+flushes a line to a stdout pipe; if the parent drains it
+            # slowly the flush blocks, stalling this tight loop between writes.
+            # A stall lets the drive's write buffer drain and the next write fails
+            # with a write error (buffer underrun) partway through. So progress is
+            # emitted at most a few times per second, on a time gate, and the
+            # writes to the drive stream without waiting on stdout.
+            last_prog = time.monotonic()
+            last_pct = -1
+            for ti, t in enumerate(tracks, start=1):
+                pcm = t["pcm"]
+                off = 0
+                while off < len(pcm):
+                    if self._cancelled:
+                        raise RuntimeError("Burn cancelled")
+                    block = pcm[off:off + AUDIO_SECTOR * SECTORS_PER_WRITE]
+                    sectors = len(block) // AUDIO_SECTOR
+                    if not self._write10_audio(handle, lba, sectors, bytearray(block), on_log):
+                        raise RuntimeError(f"Audio write failed at sector {lba}.")
+                    off += len(block)
+                    lba += sectors
+                    written += sectors
+                    now = time.monotonic()
+                    if now - last_prog >= 0.5:
+                        pct = int((written * 100) / max(1, total_sectors))
+                        if pct != last_pct:
+                            on_progress(max(0, min(99, pct)))
+                            last_pct = pct
+                        last_prog = now
+
+            on_status("Flushing drive cache (SPTI/MMC)...")
+            if not self._synchronize_cache(handle, on_log):
+                raise RuntimeError("SYNCHRONIZE CACHE failed; disc may be incomplete.")
+
+            # SAO: no CLOSE TRACK SESSION is needed; SYNCHRONIZE CACHE finalizes
+            # the disc (cookbook line 456). Sending it caused errors on some
+            # drives, so we deliberately omit it here.
+
+            on_progress(100)
+            on_status("Audio CD burned successfully (SPTI/MMC).")
+        finally:
+            self._unlock_volume(handle)
+            if eject_after:
+                try:
+                    self._scsi(handle, bytes([0x1B, 0x00, 0x00, 0x00, 0x02, 0x00,
+                                              0x00, 0x00, 0x00, 0x00]),
+                               SCSI_IOCTL_DATA_UNSPECIFIED)
+                except Exception:
+                    pass
+            try:
+                ctypes.windll.kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+
+    def _perform_opc(self, handle, on_log: OnLog) -> bool:
+        # 54h SEND OPC INFORMATION with the DoOpc bit (byte 1 bit 0) set runs
+        # Optimal Power Calibration: the drive calibrates its laser write power
+        # for THIS specific disc. Every real burner does this before the first
+        # write ("Performing OPC..."). Without it a write may start on default
+        # power but fail partway through with a Medium/Write Error (sense 03/0C),
+        # which is exactly the intermittent mid-burn failure we hit. Parameter
+        # list length 0. This can take a couple of seconds.
+        cdb = bytes([0x54, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        ok, sense, _d, status = self._scsi(handle, cdb, SCSI_IOCTL_DATA_UNSPECIFIED,
+                                           timeout=60)
+        if not ok:
+            on_log(f"spti: OPC warning ({self._sense_str(sense)}); "
+                   f"continuing (some drives calibrate implicitly)")
+        else:
+            on_log("spti: OPC (laser power calibration) complete")
+        return ok
+
+    def _mode_select_audio_sao(self, handle, on_log: OnLog, dummy: bool = False) -> bool:
+        # Write Parameters page 05h for CD-DA in SAO (Disc-At-Once) mode:
+        #   Write Type = 02h (Session-At-Once) in byte 2 bits 0-3
+        #   BUFE (byte 2 bit 6) = 1; Test Write (byte 2 bit 4) = dummy
+        #   Track Mode (byte 3 bits 0-3) = 0 (2 audio channels, no pre-emphasis)
+        #   Data Block Type (byte 4 bits 0-3) = 0 (raw 2352-byte audio)
+        #   Multi-session (byte 3 bits 6-7) = 00b -> finalize
+        page = bytearray(52)
+        page[0] = 0x05
+        page[1] = 0x32
+        b2 = 0x02 & 0x0F
+        b2 |= (1 << 6)
+        if dummy:
+            b2 |= (1 << 4)
+        page[2] = b2
+        page[3] = (0x00 << 6) | 0x00
+        page[4] = 0x00
+        page[14] = (150 >> 8) & 0xFF
+        page[15] = 150 & 0xFF
+        header = bytearray(8)
+        payload = bytes(header) + bytes(page)
+        plen = len(payload)
+        cdb = bytes([0x55, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+                     (plen >> 8) & 0xFF, plen & 0xFF, 0x00])
+        ok, sense, _d, status = self._scsi(handle, cdb, SCSI_IOCTL_DATA_OUT,
+                                           data=bytearray(payload))
+        if not ok:
+            on_log(f"spti-audio: MODE SELECT (audio SAO) failed ({self._sense_str(sense)})")
+        return ok
+
+    @staticmethod
+    def _lba_to_msf(lba: int) -> Tuple[int, int, int]:
+        # Cue sheet MSF addresses are relative to LBA -150 (add 150).
+        v = lba + 150
+        m = v // (60 * 75)
+        s = (v // 75) % 60
+        f = v % 75
+        return m, s, f
+
+    def _build_audio_cue_sheet(self, tracks, leadout_lba: int) -> bytes:
+        """Build a SEND CUE SHEET payload for a CD-DA disc.
+
+        Each cue sheet entry is 8 bytes:
+          byte 0: CTL/ADR   (0x01 = ADR 1, control 0 = audio)
+          byte 1: TNO       (track number; 0 = lead-in, 0xAA = lead-out)
+          byte 2: INDEX     (0 or 1)
+          byte 3: DATA FORM (0x00 = CD-DA main data; 0x01 = pause/pre-gap)
+          byte 4: SCMS      (0)
+          bytes 5-7: MSF absolute address
+        """
+        entries = bytearray()
+
+        def entry(ctladr, tno, index, dataform, m, s, f):
+            entries.extend([ctladr & 0xFF, tno & 0xFF, index & 0xFF,
+                            dataform & 0xFF, 0x00, m & 0xFF, s & 0xFF, f & 0xFF])
+
+        AUDIO_CTLADR = 0x01
+
+        m, s, f = self._lba_to_msf(-150)
+        entry(AUDIO_CTLADR, 0x00, 0x00, 0x01, m, s, f)  # lead-in
+
+        for i, t in enumerate(tracks, start=1):
+            start = t["start_lba"]
+            if i == 1:
+                # Track 1 mandatory 2s pre-gap (INDEX0) at LBA -150 -> MSF
+                # 00:00:00. DATA FORM = 00h for audio payload pause per cookbook
+                # line 338 ("00h for audio and 10h for data").
+                m0, s0, f0 = self._lba_to_msf(-150)
+                entry(AUDIO_CTLADR, 0x01, 0x00, 0x00, m0, s0, f0)  # track1 pre-gap
+            m1, s1, f1 = self._lba_to_msf(start)
+            entry(AUDIO_CTLADR, i & 0xFF, 0x01, 0x00, m1, s1, f1)  # INDEX1
+
+        ml, sl, fl = self._lba_to_msf(leadout_lba)
+        entry(AUDIO_CTLADR, 0xAA, 0x01, 0x01, ml, sl, fl)  # lead-out
+        return bytes(entries)
+
+    def _send_cue_sheet(self, handle, cue: bytes, on_log: OnLog) -> bool:
+        # 5Dh SEND CUE SHEET: cue sheet size in bytes 6-8 (big-endian, 24-bit).
+        n = len(cue)
+        cdb = bytes([0x5D, 0x00, 0x00, 0x00, 0x00, 0x00,
+                     (n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF, 0x00])
+        ok, sense, _d, status = self._scsi(handle, cdb, SCSI_IOCTL_DATA_OUT,
+                                           data=bytearray(cue))
+        if not ok:
+            on_log(f"spti-audio: SEND CUE SHEET failed ({self._sense_str(sense)})")
+        return ok
+
+    def _write10_audio(self, handle, lba: int, sectors: int, data: bytearray, on_log: OnLog) -> bool:
+        # Same WRITE(10) opcode; transfer length is in 2352-byte audio sectors,
+        # and the drive is in raw-audio block mode from MODE SELECT. The LBA may
+        # be NEGATIVE for the pre-gap; encode it as signed 32-bit big-endian
+        # two's-complement (-150 -> FF FF FF 6A), per cookbook line 411-412.
+        lba_bytes = struct.pack(">i", lba)
+        cdb = bytes([0x2A, 0x00]) + lba_bytes + bytes([0x00,
+                     (sectors >> 8) & 0xFF, sectors & 0xFF, 0x00])
+        ok, sense, _d, status = self._scsi(handle, cdb, SCSI_IOCTL_DATA_OUT,
+                                           data=data, timeout=120)
+        if not ok:
+            on_log(f"spti-audio: WRITE(10) failed at LBA {lba} ({self._sense_str(sense)})")
+        return ok
+
     # -- public: burn a finished ISO to a blank CD-R --------------------------
     def burn_iso(self, iso_path: Path, device: str,
                  on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
@@ -372,6 +639,10 @@ class SPTIWriter:
             on_status("Setting write parameters (SPTI/MMC)...")
             if not self._mode_select_write_params(handle, on_log, dummy=dummy):
                 raise RuntimeError("Drive rejected the write parameters (MODE SELECT 05h).")
+
+            # Calibrate laser power for this disc before writing.
+            on_status("Calibrating laser power (OPC)...")
+            self._perform_opc(handle, on_log)
 
             nwa = self._read_next_writable_address(handle, on_log)
             if nwa is None:
