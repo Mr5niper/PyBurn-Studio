@@ -393,6 +393,12 @@ class SPTIWriter:
             if not self._mode_select_audio_sao(handle, on_log, dummy=dummy):
                 raise RuntimeError("Drive rejected the audio write parameters.")
 
+            # Calibrate laser power for this disc BEFORE writing (as cdrecord's
+            # "Performing OPC..." does). Skipping this is a prime cause of a
+            # write that starts fine then fails partway with sense 03/0C.
+            on_status("Calibrating laser power (OPC)...")
+            self._perform_opc(handle, on_log)
+
             cue = self._build_audio_cue_sheet(tracks, leadout_lba)
             if not self._send_cue_sheet(handle, cue, on_log):
                 raise RuntimeError("Drive rejected the cue sheet (SEND CUE SHEET).")
@@ -416,6 +422,16 @@ class SPTIWriter:
                 remaining_pregap -= n
             # Now lba == 0; write the track payload contiguously (no gaps between
             # tracks in a pure-audio SAO session, cookbook line 443).
+            #
+            # IMPORTANT: do NOT report progress on every WRITE(10). on_progress
+            # writes+flushes a line to a stdout pipe; if the parent drains it
+            # slowly the flush blocks, stalling this tight loop between writes.
+            # A stall lets the drive's write buffer drain and the next write fails
+            # with a write error (buffer underrun) partway through. So progress is
+            # emitted at most a few times per second, on a time gate, and the
+            # writes to the drive stream without waiting on stdout.
+            last_prog = time.monotonic()
+            last_pct = -1
             for ti, t in enumerate(tracks, start=1):
                 pcm = t["pcm"]
                 off = 0
@@ -429,7 +445,13 @@ class SPTIWriter:
                     off += len(block)
                     lba += sectors
                     written += sectors
-                    on_progress(max(0, min(99, int((written * 100) / max(1, total_sectors)))))
+                    now = time.monotonic()
+                    if now - last_prog >= 0.5:
+                        pct = int((written * 100) / max(1, total_sectors))
+                        if pct != last_pct:
+                            on_progress(max(0, min(99, pct)))
+                            last_pct = pct
+                        last_prog = now
 
             on_status("Flushing drive cache (SPTI/MMC)...")
             if not self._synchronize_cache(handle, on_log):
@@ -454,6 +476,24 @@ class SPTIWriter:
                 ctypes.windll.kernel32.CloseHandle(handle)
             except Exception:
                 pass
+
+    def _perform_opc(self, handle, on_log: OnLog) -> bool:
+        # 54h SEND OPC INFORMATION with the DoOpc bit (byte 1 bit 0) set runs
+        # Optimal Power Calibration: the drive calibrates its laser write power
+        # for THIS specific disc. Every real burner does this before the first
+        # write ("Performing OPC..."). Without it a write may start on default
+        # power but fail partway through with a Medium/Write Error (sense 03/0C),
+        # which is exactly the intermittent mid-burn failure we hit. Parameter
+        # list length 0. This can take a couple of seconds.
+        cdb = bytes([0x54, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        ok, sense, _d, status = self._scsi(handle, cdb, SCSI_IOCTL_DATA_UNSPECIFIED,
+                                           timeout=60)
+        if not ok:
+            on_log(f"spti: OPC warning ({self._sense_str(sense)}); "
+                   f"continuing (some drives calibrate implicitly)")
+        else:
+            on_log("spti: OPC (laser power calibration) complete")
+        return ok
 
     def _mode_select_audio_sao(self, handle, on_log: OnLog, dummy: bool = False) -> bool:
         # Write Parameters page 05h for CD-DA in SAO (Disc-At-Once) mode:
@@ -599,6 +639,10 @@ class SPTIWriter:
             on_status("Setting write parameters (SPTI/MMC)...")
             if not self._mode_select_write_params(handle, on_log, dummy=dummy):
                 raise RuntimeError("Drive rejected the write parameters (MODE SELECT 05h).")
+
+            # Calibrate laser power for this disc before writing.
+            on_status("Calibrating laser power (OPC)...")
+            self._perform_opc(handle, on_log)
 
             nwa = self._read_next_writable_address(handle, on_log)
             if nwa is None:
