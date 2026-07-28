@@ -27,6 +27,12 @@ __pycache__/
 # --- Logs and runtime state written by the app -----------------------------
 *.log
 
+# --- per-PC settings written by the app ------------------------------------
+# pyburn_studio.config is created at runtime next to the executable (or the
+# script), records the drives found on this machine and their per-drive
+# settings, and is therefore machine-specific and never committed.
+pyburn_studio.config
+
 # --- IDE / editor ----------------------------------------------------------
 .idea/
 .vscode/
