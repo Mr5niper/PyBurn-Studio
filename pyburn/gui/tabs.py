@@ -34,6 +34,72 @@ def disk_free_bytes(path: Path) -> int:
         return 0
 
 
+def _shbrowseforfolder(parent, title: str) -> str:
+    """Show the classic Windows Shell 'Browse For Folder' dialog (the compact
+    folder tree with OK/Cancel) and return the chosen path, or "" if cancelled.
+
+    Uses the old dialog style (BIF_RETURNONLYFSDIRS, no BIF_NEWDIALOGSTYLE), which
+    is the tree-only look. Windows-only; callers fall back to a Qt chooser
+    elsewhere. Pure GUI helper.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    shell32 = ctypes.windll.shell32
+    ole32 = ctypes.windll.ole32
+
+    class BROWSEINFO(ctypes.Structure):
+        _fields_ = [
+            ("hwndOwner", wintypes.HWND),
+            ("pidlRoot", ctypes.c_void_p),
+            ("pszDisplayName", wintypes.LPWSTR),
+            ("lpszTitle", wintypes.LPCWSTR),
+            ("ulFlags", wintypes.UINT),
+            ("lpfn", ctypes.c_void_p),
+            ("lParam", wintypes.LPARAM),
+            ("iImage", ctypes.c_int),
+        ]
+
+    BIF_RETURNONLYFSDIRS = 0x00000001
+
+    shell32.SHBrowseForFolderW.argtypes = [ctypes.POINTER(BROWSEINFO)]
+    shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+    shell32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR]
+    shell32.SHGetPathFromIDListW.restype = wintypes.BOOL
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    ole32.CoTaskMemFree.restype = None
+
+    # Owner window handle, so the dialog is modal to the app when possible.
+    hwnd = 0
+    try:
+        if parent is not None:
+            hwnd = int(parent.winId())
+    except Exception:
+        hwnd = 0
+
+    display_buf = ctypes.create_unicode_buffer(260)
+    bi = BROWSEINFO()
+    bi.hwndOwner = hwnd
+    bi.pidlRoot = None
+    bi.pszDisplayName = ctypes.cast(display_buf, wintypes.LPWSTR)
+    bi.lpszTitle = title
+    bi.ulFlags = BIF_RETURNONLYFSDIRS
+    bi.lpfn = None
+    bi.lParam = 0
+    bi.iImage = 0
+
+    pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
+    if not pidl:
+        return ""
+    try:
+        path_buf = ctypes.create_unicode_buffer(260)
+        if shell32.SHGetPathFromIDListW(pidl, path_buf):
+            return path_buf.value or ""
+        return ""
+    finally:
+        ole32.CoTaskMemFree(pidl)
+
+
 class BaseTab(QWidget):
     def __init__(self, cfg: Config, tools: ToolFinder, queue: JobQueueService):
         super().__init__()
@@ -201,10 +267,68 @@ class DataBurnTab(BaseTab):
         for f in files:
             self.list.add_path(f)
 
+    def _pick_folder(self) -> str:
+        """Open a folder chooser and return the selected path (or "").
+
+        On Windows this uses the classic Shell "Browse For Folder" dialog
+        (SHBrowseForFolder, old style: a compact folder tree with OK/Cancel), via
+        ctypes. On other platforms it falls back to Qt's directory chooser. GUI
+        only; nothing here touches the burn engine.
+        """
+        try:
+            from ..services.platform_caps import is_windows
+            win = is_windows()
+        except Exception:
+            win = False
+        if win:
+            try:
+                path = _shbrowseforfolder(self, "Select a folder to add to the disc")
+                return path or ""
+            except Exception:
+                pass  # fall back to Qt below
+        d = QFileDialog.getExistingDirectory(
+            self, "Select Folder", "",
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontUseNativeDialog,
+        )
+        return d or ""
+
     def _add_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Select Folder")
-        if d:
-            self.list.add_path(d)
+        d = self._pick_folder()
+        if not d:
+            return
+        folder = Path(d)
+        name = folder.name or str(folder)
+
+        # Ask how the folder should be placed on the disc. Adding the folder
+        # itself nests everything under a top-level folder; adding its contents
+        # places the folder's files and subfolders directly at the disc root.
+        box = QMessageBox(self)
+        box.setWindowTitle("Add Folder")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"How would you like to add \"{name}\" to the disc?")
+        box.setInformativeText(
+            "Add folder: the disc will contain a top-level folder named "
+            f"\"{name}\" holding all of its files and subfolders.\n\n"
+            "Add contents: the folder's files and subfolders will be placed "
+            "directly at the root of the disc."
+        )
+        btn_folder = box.addButton("Add Folder", QMessageBox.ButtonRole.AcceptRole)
+        btn_contents = box.addButton("Add Contents", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_folder)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is btn_folder:
+            # The ISO builder nests a folder path as a top-level folder.
+            self.list.add_path(str(folder))
+        elif clicked is btn_contents:
+            # Add each immediate child so the builder places them at the root.
+            try:
+                for child in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
+                    self.list.add_path(str(child))
+            except Exception as e:
+                QMessageBox.warning(self, "Add Folder",
+                                    f"Could not read the folder's contents:\n{e}")
 
     def _rm(self):
         for it in self.list.selectedItems():
