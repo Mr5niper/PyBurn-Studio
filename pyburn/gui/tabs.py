@@ -56,6 +56,58 @@ class BaseTab(QWidget):
     def _register_job(self, job: Job):
         self._my_job_ids.add(job.id)
 
+    def _make_drive_row(self):
+        """Build a 'Drive:' row with a dropdown of optical drives plus a small
+        Refresh button, for tabs to place in their layout. The selected drive is
+        what the tab's job uses. Defaults to the configured default drive, so if
+        the user does not touch it the device is exactly what it was before.
+
+        Returns a QWidget (the row) ready to add to a layout.
+        """
+        from PyQt6.QtWidgets import QWidget as _QWidget
+        from ..core.devices import get_devices
+        row_w = _QWidget()
+        row = QHBoxLayout(row_w)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QLabel("Drive:"))
+        self.cbo_drive = QComboBox()
+        self._populate_drives(get_devices())
+        row.addWidget(self.cbo_drive, 1)
+        b_refresh = QPushButton("Refresh")
+        b_refresh.setToolTip("Rescan for optical drives")
+        b_refresh.clicked.connect(self._refresh_drives)
+        row.addWidget(b_refresh)
+        return row_w
+
+    def _populate_drives(self, devs):
+        cur = self.cfg.settings.get("default_device", "")
+        self.cbo_drive.clear()
+        sel = -1
+        for i, d in enumerate(devs):
+            self.cbo_drive.addItem(d.display, d.id)
+            if d.id == cur:
+                sel = i
+        if not devs:
+            # Keep a usable fallback so the dropdown is never empty.
+            self.cbo_drive.addItem(str(cur or "default"), cur or "")
+            sel = 0
+        if sel >= 0:
+            self.cbo_drive.setCurrentIndex(sel)
+
+    def _refresh_drives(self):
+        from ..core.devices import refresh_devices
+        self._populate_drives(refresh_devices())
+
+    def selected_device(self) -> str:
+        """The drive chosen in this tab's dropdown, or the configured default if
+        the tab has no dropdown, so callers always get a valid device."""
+        cbo = getattr(self, "cbo_drive", None)
+        if cbo is not None:
+            data = cbo.currentData()
+            if data:
+                return data
+        return self.cfg.settings.get("default_device", "/dev/sr0")
+
     def _job_finished(self, job_id: str, ok: bool, msg: str):
         if job_id not in self._my_job_ids:
             return
@@ -82,6 +134,7 @@ class DataBurnTab(BaseTab):
         title = QLabel("Burn Data Disc")
         title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         lay.addWidget(title)
+        lay.addWidget(self._make_drive_row())
         self.list = FileListWidget(allow_dirs=True)
         lay.addWidget(QLabel("Files/Folders (drag & drop):"))
         lay.addWidget(self.list)
@@ -189,7 +242,7 @@ class DataBurnTab(BaseTab):
                 return
         if not self._warn_oversized_media(self.gauge.current_size, self._capacity()):
             return
-        device = self.cfg.settings.get("default_device", "/dev/sr0")
+        device = self.selected_device()
         if not self._confirm_blank_if_needed(device):
             QMessageBox.information(self, "Cancelled", "Blanking cancelled. Job not queued.")
             return
@@ -231,6 +284,7 @@ class AudioCDTab(BaseTab):
         title = QLabel("Create Audio CD")
         title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         lay.addWidget(title)
+        lay.addWidget(self._make_drive_row())
         self.list = FileListWidget(allow_dirs=False, exts=["mp3", "wav", "flac", "ogg", "m4a", "aac"])
         lay.addWidget(QLabel("Audio files (drag & drop):"))
         lay.addWidget(self.list)
@@ -394,7 +448,7 @@ class AudioCDTab(BaseTab):
         job = Job(
             job_type=JobType.AUDIO,
             files=[Path(self.list.item(i).text()) for i in range(cnt)],
-            device=self.cfg.settings.get("default_device", "/dev/sr0"),
+            device=self.selected_device(),
             options=JobOptions(
                 temp_dir=temp_dir,
                 speed=self.cfg.settings.get("burn_speed", "Auto"),
@@ -418,6 +472,7 @@ class VideoDVDTab(BaseTab):
         title = QLabel("Create Video DVD")
         title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         lay.addWidget(title)
+        lay.addWidget(self._make_drive_row())
         self.list = FileListWidget(allow_dirs=False, exts=["mp4", "avi", "mkv", "mov", "wmv", "flv"])
         lay.addWidget(QLabel("Video files (drag & drop):"))
         lay.addWidget(self.list)
@@ -531,7 +586,7 @@ class VideoDVDTab(BaseTab):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if r != QMessageBox.StandardButton.Yes:
                 return
-        device = self.cfg.settings.get("default_device", "/dev/sr0")
+        device = self.selected_device()
         if not self._confirm_blank_if_needed(device):
             QMessageBox.information(self, "Cancelled", "Blanking cancelled. Job not queued.")
             return
@@ -569,6 +624,7 @@ class VideoBDTab(BaseTab):
         title = QLabel("Create Blu-ray (BDMV)")
         title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         lay.addWidget(title)
+        lay.addWidget(self._make_drive_row())
         self.list = FileListWidget(allow_dirs=False, exts=["mp4", "mkv", "mov", "ts", "m2ts"])
         lay.addWidget(QLabel("Video files (drag & drop):"))
         lay.addWidget(self.list)
@@ -680,7 +736,7 @@ class VideoBDTab(BaseTab):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if r != QMessageBox.StandardButton.Yes:
                 return
-        device = self.cfg.settings.get("default_device", "/dev/sr0")
+        device = self.selected_device()
         if not self._confirm_blank_if_needed(device):
             QMessageBox.information(self, "Cancelled", "Blanking cancelled. Job not queued.")
             return
@@ -718,6 +774,7 @@ class RipCDTab(BaseTab):
         title = QLabel("Rip Audio CD")
         title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         lay.addWidget(title)
+        lay.addWidget(self._make_drive_row())
         opts = QGroupBox("Rip Options")
         form = QFormLayout()
         self.cbo_fmt = QComboBox()
@@ -783,7 +840,7 @@ class RipCDTab(BaseTab):
             self.track_titles = md.get("tracks") or []
             QMessageBox.information(self, "MusicBrainz", f"Found {len(self.track_titles)} track titles.")
 
-        th = MBThread(self.tools, self.cfg.settings.get("default_device", "/dev/sr0"))
+        th = MBThread(self.tools, self.selected_device())
         th.finished_data.connect(done)
         th.start()
         self._mb_thread = th  # hold ref
@@ -820,7 +877,7 @@ class RipCDTab(BaseTab):
         job = Job(
             job_type=JobType.RIP,
             files=[],
-            device=self.cfg.settings.get("default_device", "/dev/sr0"),
+            device=self.selected_device(),
             options=JobOptions(
                 temp_dir=Path(self.cfg.settings["temp_dir"]),
                 output_dir=out,

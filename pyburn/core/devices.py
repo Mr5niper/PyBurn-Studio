@@ -95,3 +95,24 @@ class DeviceScanner:
 
     def _scan_macos(self) -> List[DeviceInfo]:
         return [DeviceInfo("/dev/disk2", "/dev/disk2 (default)")]
+
+
+# Process-wide cache of the optical-drive scan. Scanning on Windows shells out to
+# PowerShell (slow cold start), so multiple drive dropdowns sharing one cached
+# result avoids a visible delay each time a tab or dialog builds its list. Call
+# refresh_devices() to force a fresh scan (for example after inserting a drive).
+_CACHED_DEVICES: List[DeviceInfo] = []
+
+
+def get_devices(force: bool = False) -> List[DeviceInfo]:
+    global _CACHED_DEVICES
+    if force or not _CACHED_DEVICES:
+        try:
+            _CACHED_DEVICES = DeviceScanner().scan_devices()
+        except Exception:
+            _CACHED_DEVICES = []
+    return list(_CACHED_DEVICES)
+
+
+def refresh_devices() -> List[DeviceInfo]:
+    return get_devices(force=True)
