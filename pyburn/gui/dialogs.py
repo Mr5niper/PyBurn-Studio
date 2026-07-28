@@ -4,9 +4,7 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QLineEdit, QSpinBox, QCheckBox, QPushButton,
     QDialogButtonBox, QFileDialog, QTextEdit, QWidget, QHBoxLayout, QComboBox, QMessageBox
 )
-from PyQt6.QtCore import QTimer
 from ..core.config import Config
-from ..core.devices import DeviceScanner
 
 
 class SettingsDialog(QDialog):
@@ -14,68 +12,152 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.cfg = cfg
         self.setWindowTitle("Settings")
+        self._current_drive = None  # the drive whose per-drive settings are shown
         lay = QVBoxLayout(self)
-        form = QFormLayout()
+
+        # ---- Per-drive section ---------------------------------------------
+        from PyQt6.QtWidgets import QGroupBox, QLabel
+        drive_box = QGroupBox("Drive settings (per drive)")
+        dform = QFormLayout()
         self.cbo_dev = QComboBox()
-        self._populate()
         b_scan = QPushButton("Scan")
-        b_scan.clicked.connect(self._populate)
-        row = QHBoxLayout()
-        row.addWidget(self.cbo_dev)
-        row.addWidget(b_scan)
-        form.addRow("Disc Device:", row)
+        b_scan.clicked.connect(self._rescan)
+        drow = QHBoxLayout()
+        drow.addWidget(self.cbo_dev, 1)
+        drow.addWidget(b_scan)
+        dform.addRow("Drive:", drow)
+
+        self.lbl_default = QLabel("")
+        self.btn_default = QPushButton("Set as default drive")
+        self.btn_default.clicked.connect(self._set_default)
+        defrow = QHBoxLayout()
+        defrow.addWidget(self.lbl_default, 1)
+        defrow.addWidget(self.btn_default)
+        dform.addRow("", defrow)
+
         self.spd = QComboBox()
         self.spd.addItems(["Auto"] + [str(x) for x in [2, 4, 6, 8, 12, 16, 24, 32, 40, 48, 52]])
-        self.spd.setCurrentText(str(self.cfg.settings.get("burn_speed", "Auto")))
-        form.addRow("Default Burn Speed:", self.spd)
+        dform.addRow("Burn Speed:", self.spd)
+        self.chk_v = QCheckBox("Verify after burn")
+        dform.addRow("", self.chk_v)
+        self.chk_blank = QCheckBox("Auto-blank RW media")
+        dform.addRow("", self.chk_blank)
+        self.chk_eject = QCheckBox("Eject after burn")
+        dform.addRow("", self.chk_eject)
+        drive_box.setLayout(dform)
+        lay.addWidget(drive_box)
+
+        # Persist per-drive edits immediately as they change, into the currently
+        # selected drive's block, so switching drives never loses edits.
+        self.spd.currentTextChanged.connect(self._save_current_drive)
+        self.chk_v.toggled.connect(self._save_current_drive)
+        self.chk_blank.toggled.connect(self._save_current_drive)
+        self.chk_eject.toggled.connect(self._save_current_drive)
+        self.cbo_dev.currentIndexChanged.connect(self._on_drive_changed)
+
+        # ---- Global section -------------------------------------------------
+        global_box = QGroupBox("Global settings (all drives)")
+        gform = QFormLayout()
         self.temp = QLineEdit(cfg.settings.get("temp_dir", str(Path.home() / "PyBurn_Temp")))
         b_browse = QPushButton("Browse")
         b_browse.clicked.connect(self._choose)
         trow = QHBoxLayout()
-        trow.addWidget(self.temp)
+        trow.addWidget(self.temp, 1)
         trow.addWidget(b_browse)
-        form.addRow("Temp Directory:", trow)
-        self.chk_v = QCheckBox("Verify after burn")
-        self.chk_v.setChecked(bool(cfg.settings.get("verify_after_burn", True)))
-        form.addRow("", self.chk_v)
-        self.chk_blank = QCheckBox("Auto-blank RW media")
-        self.chk_blank.setChecked(bool(cfg.settings.get("auto_blank_rw", True)))
-        form.addRow("", self.chk_blank)
-        self.chk_eject = QCheckBox("Eject after burn")
-        self.chk_eject.setChecked(bool(cfg.settings.get("eject_after_burn", True)))
-        form.addRow("", self.chk_eject)
+        gform.addRow("Temp Directory:", trow)
+
         self.chk_sim = QCheckBox("Simulate when tools are missing")
         self.chk_sim.setChecked(bool(cfg.settings.get("simulate_when_missing_tools", True)))
-        form.addRow("", self.chk_sim)
+        gform.addRow("", self.chk_sim)
         self.chk_mb = QCheckBox("Enable MusicBrainz lookup")
         self.chk_mb.setChecked(bool(cfg.settings.get("musicbrainz_enabled", True)))
-        form.addRow("", self.chk_mb)
-        lay.addLayout(form)
+        gform.addRow("", self.chk_mb)
+        global_box.setLayout(gform)
+        lay.addWidget(global_box)
+
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
 
-    def _populate(self):
-        # Non-blocking device scan with indicator
-        self.cbo_dev.clear()
-        self.cbo_dev.addItem("Scanning devices...")
-        QTimer.singleShot(100, self._scan_async)
+        # Populate drives from the shared cache (fast); this also selects the
+        # default drive and loads its per-drive settings.
+        self._load_drive_list(force=False)
 
-    def _scan_async(self):
+    # -- drive list + per-drive load/save ------------------------------------
+    def _load_drive_list(self, force: bool):
+        from ..core.devices import get_devices, refresh_devices
+        devs = refresh_devices() if force else get_devices()
+        # Make sure each discovered drive has a settings block seeded.
         try:
-            devs = DeviceScanner().scan_devices()
+            self.cfg.ensure_drives_registered([d.id for d in devs])
+            self.cfg.save()
         except Exception:
-            devs = []
+            pass
+        self.cbo_dev.blockSignals(True)
         self.cbo_dev.clear()
         cur = self.cfg.settings.get("default_device", "")
-        idx = -1
+        sel = -1
         for i, d in enumerate(devs):
             self.cbo_dev.addItem(d.display, d.id)
             if d.id == cur:
-                idx = i
-        if idx >= 0:
-            self.cbo_dev.setCurrentIndex(idx)
+                sel = i
+        if not devs:
+            self.cbo_dev.addItem(str(cur or "default"), cur or "")
+            sel = 0
+        if sel >= 0:
+            self.cbo_dev.setCurrentIndex(sel)
+        self.cbo_dev.blockSignals(False)
+        self._on_drive_changed()
+
+    def _rescan(self):
+        self._load_drive_list(force=True)
+
+    def _current_device_id(self):
+        i = self.cbo_dev.currentIndex()
+        if i < 0:
+            return None
+        return self.cbo_dev.itemData(i)
+
+    def _on_drive_changed(self):
+        dev = self._current_device_id()
+        self._current_drive = dev
+        if not dev:
+            return
+        opts = self.cfg.drive_options(dev)
+        # Load without triggering the change-save handlers.
+        for w in (self.spd, self.chk_v, self.chk_blank, self.chk_eject):
+            w.blockSignals(True)
+        self.spd.setCurrentText(str(opts.get("burn_speed", "Auto")))
+        self.chk_v.setChecked(bool(opts.get("verify_after_burn", True)))
+        self.chk_blank.setChecked(bool(opts.get("auto_blank_rw", True)))
+        self.chk_eject.setChecked(bool(opts.get("eject_after_burn", True)))
+        for w in (self.spd, self.chk_v, self.chk_blank, self.chk_eject):
+            w.blockSignals(False)
+        default_dev = self.cfg.settings.get("default_device", "")
+        if dev == default_dev:
+            self.lbl_default.setText("This is the default drive.")
+            self.btn_default.setEnabled(False)
+        else:
+            self.lbl_default.setText("Not the default drive.")
+            self.btn_default.setEnabled(True)
+
+    def _save_current_drive(self):
+        dev = self._current_drive
+        if not dev:
+            return
+        self.cfg.set_drive_setting(dev, "burn_speed", self.spd.currentText())
+        self.cfg.set_drive_setting(dev, "verify_after_burn", self.chk_v.isChecked())
+        self.cfg.set_drive_setting(dev, "auto_blank_rw", self.chk_blank.isChecked())
+        self.cfg.set_drive_setting(dev, "eject_after_burn", self.chk_eject.isChecked())
+        self.cfg.save()
+
+    def _set_default(self):
+        dev = self._current_device_id()
+        if dev:
+            self.cfg.settings["default_device"] = dev
+            self.cfg.save()
+            self._on_drive_changed()
 
     def _choose(self):
         d = QFileDialog.getExistingDirectory(self, "Choose Temporary Directory")
@@ -83,13 +165,9 @@ class SettingsDialog(QDialog):
             self.temp.setText(d)
 
     def accept(self):
-        i = self.cbo_dev.currentIndex()
-        if i >= 0:
-            device_id = self.cbo_dev.itemData(i)
-            # Ensure we have a valid device ID and it's not the scanning placeholder
-            if device_id is not None and self.cbo_dev.itemText(i) != "Scanning devices...":
-                self.cfg.settings["default_device"] = device_id
-        self.cfg.settings["burn_speed"] = self.spd.currentText()
+        # Per-drive settings are already saved live; here we commit the global
+        # settings.
+        self._save_current_drive()
         temp_path = Path(self.temp.text().strip())
         try:
             temp_path.mkdir(parents=True, exist_ok=True)
@@ -101,9 +179,6 @@ class SettingsDialog(QDialog):
                                 f"Cannot write to temp directory:\n{temp_path}\n\nError: {e}")
             return
         self.cfg.settings["temp_dir"] = str(temp_path)
-        self.cfg.settings["verify_after_burn"] = self.chk_v.isChecked()
-        self.cfg.settings["auto_blank_rw"] = self.chk_blank.isChecked()
-        self.cfg.settings["eject_after_burn"] = self.chk_eject.isChecked()
         self.cfg.settings["simulate_when_missing_tools"] = self.chk_sim.isChecked()
         self.cfg.settings["musicbrainz_enabled"] = self.chk_mb.isChecked()
         self.cfg.save()

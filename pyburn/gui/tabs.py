@@ -108,6 +108,25 @@ class BaseTab(QWidget):
                 return data
         return self.cfg.settings.get("default_device", "/dev/sr0")
 
+    def _confirm_blank_if_needed(self, device: str) -> bool:
+        # Auto-blank is a per-drive setting now (Settings window), not a per-tab
+        # checkbox. If it is off for this drive, nothing to confirm.
+        if not self.cfg.drive_setting(device, "auto_blank_rw", True):
+            return True
+        try:
+            media = MediaTools(self.tools, ProcessRunner())
+            info = media.get_info(device)
+            if info.get("rewritable") and info.get("blank") is False:
+                r = QMessageBox.question(self, "Blank Media?",
+                                         f"Rewritable media detected in {device}.\n"
+                                         f"This will ERASE all existing data.\n\n"
+                                         f"Continue with blanking?",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                return r == QMessageBox.StandardButton.Yes
+        except Exception:
+            pass
+        return True
+
     def _job_finished(self, job_id: str, ok: bool, msg: str):
         if job_id not in self._my_job_ids:
             return
@@ -153,22 +172,10 @@ class DataBurnTab(BaseTab):
         opts = QGroupBox("Options")
         form = QFormLayout()
         self.ed_vol = QLineEdit("DATA_DISC")
-        self.chk_verify = QCheckBox("Verify after burn")
-        self.chk_verify.setChecked(bool(self.cfg.settings.get("verify_after_burn", True)))
-        self.chk_blank = QCheckBox("Auto-blank RW media")
-        self.chk_blank.setChecked(bool(self.cfg.settings.get("auto_blank_rw", True)))
-        self.chk_eject = QCheckBox("Eject after burn")
-        self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
-        self.chk_dummy = QCheckBox("Test burn (simulate, no disc written)")
-        self.chk_dummy.setChecked(False)
         self.cbo_type = QComboBox()
         self.cbo_type.addItems(["CD (700MB)", "DVD (4.7GB)", "Blu-ray (25GB)"])
         form.addRow("Volume Label:", self.ed_vol)
         form.addRow("Disc Type:", self.cbo_type)
-        form.addRow("", self.chk_verify)
-        form.addRow("", self.chk_blank)
-        form.addRow("", self.chk_eject)
-        form.addRow("", self.chk_dummy)
         opts.setLayout(form)
         lay.addWidget(opts)
         self.gauge = CapacityGauge(DVD_BYTES)
@@ -213,23 +220,6 @@ class DataBurnTab(BaseTab):
             return r == QMessageBox.StandardButton.Yes
         return True
 
-    def _confirm_blank_if_needed(self, device: str) -> bool:
-        if not self.chk_blank.isChecked():
-            return True
-        try:
-            media = MediaTools(self.tools, ProcessRunner())
-            info = media.get_info(device)
-            if info.get("rewritable") and info.get("blank") is False:
-                r = QMessageBox.question(self, "Blank Media?",
-                                         f"Rewritable media detected in {device}.\n"
-                                         f"This will ERASE all existing data.\n\n"
-                                         f"Continue with blanking?",
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                return r == QMessageBox.StandardButton.Yes
-        except Exception:
-            pass
-        return True
-
     def _start(self):
         files = self.list.get_file_list()
         if not files:
@@ -262,12 +252,13 @@ class DataBurnTab(BaseTab):
             files=[Path(p) for p in files],
             device=device,
             options=JobOptions(
-                temp_dir=temp_dir, verify=self.chk_verify.isChecked(),
-                speed=self.cfg.settings.get("burn_speed", "Auto"),
+                temp_dir=temp_dir,
+                verify=self.cfg.drive_setting(device, "verify_after_burn", True),
+                speed=self.cfg.drive_setting(device, "burn_speed", "Auto"),
                 volume_label=self.ed_vol.text().strip() or "DATA_DISC",
-                auto_blank=self.chk_blank.isChecked(),
-                eject_after=self.chk_eject.isChecked(),
-                dummy=self.chk_dummy.isChecked(),
+                auto_blank=self.cfg.drive_setting(device, "auto_blank_rw", True),
+                eject_after=self.cfg.drive_setting(device, "eject_after_burn", True),
+                dummy=False,
             ),
         )
         self._register_job(job)
@@ -315,9 +306,6 @@ class AudioCDTab(BaseTab):
         lay.addWidget(self.btn_guess)
         self.gauge = CapacityGauge(CD_BYTES, mode="minutes", max_minutes=80.0)
         lay.addWidget(self.gauge)
-        self.chk_eject = QCheckBox("Eject after burn")
-        self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
-        lay.addWidget(self.chk_eject)
         self.btn = QPushButton("Burn Audio CD")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
@@ -451,8 +439,8 @@ class AudioCDTab(BaseTab):
             device=self.selected_device(),
             options=JobOptions(
                 temp_dir=temp_dir,
-                speed=self.cfg.settings.get("burn_speed", "Auto"),
-                eject_after=self.chk_eject.isChecked(),
+                speed=self.cfg.drive_setting(self.selected_device(), "burn_speed", "Auto"),
+                eject_after=self.cfg.drive_setting(self.selected_device(), "eject_after_burn", True),
                 album_title=self.ed_album.text().strip() or None,
                 album_performer=self.ed_artist.text().strip() or None,
                 track_titles=self.track_titles if self.track_titles else None,
@@ -488,12 +476,6 @@ class VideoDVDTab(BaseTab):
         lay.addLayout(row)
         self.gauge = CapacityGauge(DVD_BYTES, mode="minutes", max_minutes=dvd_max_minutes())
         lay.addWidget(self.gauge)
-        self.chk_blank = QCheckBox("Auto-blank RW media")
-        self.chk_blank.setChecked(bool(self.cfg.settings.get("auto_blank_rw", True)))
-        self.chk_eject = QCheckBox("Eject after burn")
-        self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
-        lay.addWidget(self.chk_blank)
-        lay.addWidget(self.chk_eject)
         self.btn = QPushButton("Burn Video DVD")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
@@ -545,23 +527,6 @@ class VideoDVDTab(BaseTab):
         self._dur_threads.add(thread)
         thread.start()
 
-    def _confirm_blank_if_needed(self, device: str) -> bool:
-        if not self.chk_blank.isChecked():
-            return True
-        try:
-            media = MediaTools(self.tools, ProcessRunner())
-            info = media.get_info(device)
-            if info.get("rewritable") and info.get("blank") is False:
-                r = QMessageBox.question(self, "Blank Media?",
-                                         f"Rewritable media detected in {device}.\n"
-                                         f"This will ERASE all existing data.\n\n"
-                                         f"Continue with blanking?",
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                return r == QMessageBox.StandardButton.Yes
-        except Exception:
-            pass
-        return True
-
     def _add(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Select Video Files", "", "Video (*.mp4 *.avi *.mkv *.mov *.wmv *.flv)")
         for f in files:
@@ -608,7 +573,8 @@ class VideoDVDTab(BaseTab):
             files=[Path(self.list.item(i).text()) for i in range(self.list.count())],
             device=device,
             options=JobOptions(temp_dir=temp_dir, speed=self.cfg.settings.get("burn_speed", "Auto"),
-                               auto_blank=self.chk_blank.isChecked(), eject_after=self.chk_eject.isChecked()),
+                               auto_blank=self.cfg.drive_setting(device, "auto_blank_rw", True),
+                               eject_after=self.cfg.drive_setting(device, "eject_after_burn", True)),
         )
         self._register_job(job)
         self.queue.enqueue(job)
@@ -640,12 +606,6 @@ class VideoBDTab(BaseTab):
         lay.addLayout(row)
         self.gauge = CapacityGauge(BD25_BYTES, mode="minutes", max_minutes=bd_max_minutes())
         lay.addWidget(self.gauge)
-        self.chk_blank = QCheckBox("Auto-blank RW media")
-        self.chk_blank.setChecked(bool(self.cfg.settings.get("auto_blank_rw", True)))
-        self.chk_eject = QCheckBox("Eject after burn")
-        self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
-        lay.addWidget(self.chk_blank)
-        lay.addWidget(self.chk_eject)
         self.btn = QPushButton("Burn Blu-ray")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
@@ -695,23 +655,6 @@ class VideoBDTab(BaseTab):
         self._dur_threads.add(thread)
         thread.start()
 
-    def _confirm_blank_if_needed(self, device: str) -> bool:
-        if not self.chk_blank.isChecked():
-            return True
-        try:
-            media = MediaTools(self.tools, ProcessRunner())
-            info = media.get_info(device)
-            if info.get("rewritable") and info.get("blank") is False:
-                r = QMessageBox.question(self, "Blank Media?",
-                                         f"Rewritable media detected in {device}.\n"
-                                         f"This will ERASE all existing data.\n\n"
-                                         f"Continue with blanking?",
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                return r == QMessageBox.StandardButton.Yes
-        except Exception:
-            pass
-        return True
-
     def _add(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Select Video Files", "", "Video (*.mp4 *.mkv *.mov *.ts *.m2ts)")
         for f in files:
@@ -757,7 +700,8 @@ class VideoBDTab(BaseTab):
             files=[Path(self.list.item(i).text()) for i in range(self.list.count())],
             device=device,
             options=JobOptions(temp_dir=temp_dir, speed=self.cfg.settings.get("burn_speed", "Auto"),
-                               auto_blank=self.chk_blank.isChecked(), eject_after=self.chk_eject.isChecked()),
+                               auto_blank=self.cfg.drive_setting(device, "auto_blank_rw", True),
+                               eject_after=self.cfg.drive_setting(device, "eject_after_burn", True)),
         )
         self._register_job(job)
         self.queue.enqueue(job)
