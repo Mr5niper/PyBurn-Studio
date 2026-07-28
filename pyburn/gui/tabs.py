@@ -202,9 +202,48 @@ class DataBurnTab(BaseTab):
             self.list.add_path(f)
 
     def _add_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Select Folder")
-        if d:
-            self.list.add_path(d)
+        # Use the compact tree-only folder chooser (Qt's non-native dialog),
+        # not the Explorer-style native dialog that shows a file list.
+        d = QFileDialog.getExistingDirectory(
+            self, "Select Folder",
+            "",
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not d:
+            return
+        folder = Path(d)
+        name = folder.name or str(folder)
+
+        # Ask how the folder should be placed on the disc. Adding the folder
+        # itself nests everything under a top-level folder; adding its contents
+        # places the folder's files and subfolders directly at the disc root.
+        box = QMessageBox(self)
+        box.setWindowTitle("Add Folder")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"How would you like to add \"{name}\" to the disc?")
+        box.setInformativeText(
+            "Add folder: the disc will contain a top-level folder named "
+            f"\"{name}\" holding all of its files and subfolders.\n\n"
+            "Add contents: the folder's files and subfolders will be placed "
+            "directly at the root of the disc."
+        )
+        btn_folder = box.addButton("Add Folder", QMessageBox.ButtonRole.AcceptRole)
+        btn_contents = box.addButton("Add Contents", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_folder)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is btn_folder:
+            # The ISO builder nests a folder path as a top-level folder.
+            self.list.add_path(str(folder))
+        elif clicked is btn_contents:
+            # Add each immediate child so the builder places them at the root.
+            try:
+                for child in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
+                    self.list.add_path(str(child))
+            except Exception as e:
+                QMessageBox.warning(self, "Add Folder",
+                                    f"Could not read the folder's contents:\n{e}")
 
     def _rm(self):
         for it in self.list.selectedItems():
