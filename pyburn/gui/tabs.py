@@ -34,6 +34,72 @@ def disk_free_bytes(path: Path) -> int:
         return 0
 
 
+def _shbrowseforfolder(parent, title: str) -> str:
+    """Show the classic Windows Shell 'Browse For Folder' dialog (the compact
+    folder tree with OK/Cancel) and return the chosen path, or "" if cancelled.
+
+    Uses the old dialog style (BIF_RETURNONLYFSDIRS, no BIF_NEWDIALOGSTYLE), which
+    is the tree-only look. Windows-only; callers fall back to a Qt chooser
+    elsewhere. Pure GUI helper.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    shell32 = ctypes.windll.shell32
+    ole32 = ctypes.windll.ole32
+
+    class BROWSEINFO(ctypes.Structure):
+        _fields_ = [
+            ("hwndOwner", wintypes.HWND),
+            ("pidlRoot", ctypes.c_void_p),
+            ("pszDisplayName", wintypes.LPWSTR),
+            ("lpszTitle", wintypes.LPCWSTR),
+            ("ulFlags", wintypes.UINT),
+            ("lpfn", ctypes.c_void_p),
+            ("lParam", wintypes.LPARAM),
+            ("iImage", ctypes.c_int),
+        ]
+
+    BIF_RETURNONLYFSDIRS = 0x00000001
+
+    shell32.SHBrowseForFolderW.argtypes = [ctypes.POINTER(BROWSEINFO)]
+    shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+    shell32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR]
+    shell32.SHGetPathFromIDListW.restype = wintypes.BOOL
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    ole32.CoTaskMemFree.restype = None
+
+    # Owner window handle, so the dialog is modal to the app when possible.
+    hwnd = 0
+    try:
+        if parent is not None:
+            hwnd = int(parent.winId())
+    except Exception:
+        hwnd = 0
+
+    display_buf = ctypes.create_unicode_buffer(260)
+    bi = BROWSEINFO()
+    bi.hwndOwner = hwnd
+    bi.pidlRoot = None
+    bi.pszDisplayName = ctypes.cast(display_buf, wintypes.LPWSTR)
+    bi.lpszTitle = title
+    bi.ulFlags = BIF_RETURNONLYFSDIRS
+    bi.lpfn = None
+    bi.lParam = 0
+    bi.iImage = 0
+
+    pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
+    if not pidl:
+        return ""
+    try:
+        path_buf = ctypes.create_unicode_buffer(260)
+        if shell32.SHGetPathFromIDListW(pidl, path_buf):
+            return path_buf.value or ""
+        return ""
+    finally:
+        ole32.CoTaskMemFree(pidl)
+
+
 class BaseTab(QWidget):
     def __init__(self, cfg: Config, tools: ToolFinder, queue: JobQueueService):
         super().__init__()
@@ -201,14 +267,33 @@ class DataBurnTab(BaseTab):
         for f in files:
             self.list.add_path(f)
 
-    def _add_dir(self):
-        # Use the compact tree-only folder chooser (Qt's non-native dialog),
-        # not the Explorer-style native dialog that shows a file list.
+    def _pick_folder(self) -> str:
+        """Open a folder chooser and return the selected path (or "").
+
+        On Windows this uses the classic Shell "Browse For Folder" dialog
+        (SHBrowseForFolder, old style: a compact folder tree with OK/Cancel), via
+        ctypes. On other platforms it falls back to Qt's directory chooser. GUI
+        only; nothing here touches the burn engine.
+        """
+        try:
+            from ..services.platform_caps import is_windows
+            win = is_windows()
+        except Exception:
+            win = False
+        if win:
+            try:
+                path = _shbrowseforfolder(self, "Select a folder to add to the disc")
+                return path or ""
+            except Exception:
+                pass  # fall back to Qt below
         d = QFileDialog.getExistingDirectory(
-            self, "Select Folder",
-            "",
+            self, "Select Folder", "",
             QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontUseNativeDialog,
         )
+        return d or ""
+
+    def _add_dir(self):
+        d = self._pick_folder()
         if not d:
             return
         folder = Path(d)
