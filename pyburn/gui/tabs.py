@@ -48,9 +48,24 @@ class BaseTab(QWidget):
         # regardless of which tab started it.
         self._my_job_ids: set[str] = set()
         self.queue.sig_status_update.connect(self._status_update)
+        # Surface job outcomes for this tab's jobs. Without this a failure (for
+        # example ripping with no disc in the drive) only updated the Queue list,
+        # so a user on this tab saw nothing happen and got no error.
+        self.queue.sig_job_finished.connect(self._job_finished)
 
     def _register_job(self, job: Job):
         self._my_job_ids.add(job.id)
+
+    def _job_finished(self, job_id: str, ok: bool, msg: str):
+        if job_id not in self._my_job_ids:
+            return
+        if ok:
+            self.status.setText(msg or "Done.")
+        else:
+            self.status.setText(f"Failed: {msg}" if msg else "Failed.")
+            self.progress.setValue(0)
+            QMessageBox.warning(self, "Job Failed",
+                                msg or "The job did not complete. Check the drive and try again.")
 
     def _status_update(self, job_id: str, status: str, progress: int):
         if job_id not in self._my_job_ids:

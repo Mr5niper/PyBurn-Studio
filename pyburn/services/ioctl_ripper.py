@@ -88,7 +88,14 @@ class IOCTLRipper:
             None, 0, buf, len(buf), ctypes.byref(returned), None,
         )
         if not ok:
-            raise OSError("IOCTL_CDROM_READ_TOC failed")
+            err = kernel32.GetLastError()
+            # ERROR_NOT_READY (21) and ERROR_NO_MEDIA_IN_DRIVE (1112) mean the
+            # drive is empty. Give the user a plain "no disc" message instead of a
+            # raw IOCTL error.
+            if err in (21, 1112):
+                raise RuntimeError("No disc in the drive. Insert an audio CD and try again.")
+            raise OSError(f"Could not read the disc (IOCTL_CDROM_READ_TOC failed, error {err}). "
+                          f"Make sure an audio CD is inserted and readable.")
         first = buf.raw[2]
         last = buf.raw[3]
 
