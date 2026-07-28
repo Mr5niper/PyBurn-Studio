@@ -204,7 +204,9 @@ class DataBurnTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
+        # Job start is shown non-modally in the status line and the Queue tab;
+        # no blocking popup is needed.
+        self.status.setText(f"Started: {job.display_name}")
 
 
 class AudioCDTab(BaseTab):
@@ -389,7 +391,9 @@ class AudioCDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
+        # Job start is shown non-modally in the status line and the Queue tab;
+        # no blocking popup is needed.
+        self.status.setText(f"Started: {job.display_name}")
 
 
 class VideoDVDTab(BaseTab):
@@ -538,7 +542,9 @@ class VideoDVDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
+        # Job start is shown non-modally in the status line and the Queue tab;
+        # no blocking popup is needed.
+        self.status.setText(f"Started: {job.display_name}")
 
 
 class VideoBDTab(BaseTab):
@@ -684,7 +690,9 @@ class VideoBDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
+        # Job start is shown non-modally in the status line and the Queue tab;
+        # no blocking popup is needed.
+        self.status.setText(f"Started: {job.display_name}")
 
 
 class RipCDTab(BaseTab):
@@ -808,4 +816,6 @@ class RipCDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
+        # Job start is shown non-modally in the status line and the Queue tab;
+        # no blocking popup is needed.
+        self.status.setText(f"Started: {job.display_name}")

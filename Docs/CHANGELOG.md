@@ -45,6 +45,11 @@ progress is exact, and there is no COM in the write path to interfere with it.
   needed only for Video DVD and Blu-ray.
 
 ### Fixed
+- The build documentation (Docs/BUILD_EXE.md) described a spec-based PyInstaller
+  build, but the build is driven entirely by BUILD_EXE.bat's command-line
+  PyInstaller invocation and no spec is checked in or used. Rewrote it to match
+  the actual build (the batch file's steps and the exact command), and clarified
+  that any generated pyburn_studio.spec is a throwaway byproduct.
 - Data burns no longer corrupt on drives where IMAPI2's write-progress events
   interfered with the synchronous write; the SPTI engine removes that failure
   mode entirely.
