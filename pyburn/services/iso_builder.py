@@ -182,8 +182,57 @@ class ISOBuilder:
         for p in files:
             add_path(root, p)
 
-        # 2) Assign names (ISO 8.3 + Joliet UCS-2), collecting all directories in
-        #    breadth-first order (root first) for the path tables.
+        return self._author(root, out_iso, vol_id, on_status, on_log)
+
+    def build_tree(self, tree, out_iso: Path, volume: str,
+                   on_status: OnStatus, on_log: OnLog) -> Path:
+        """Author an ISO from an explicitly described disc tree, which lets the
+        caller rearrange, rename, and create folders that do not exist on disk.
+
+        `tree` describes the disc ROOT's children as a list of dicts:
+          file:   {"name": <on-disc name>, "src": <source path on disk>}
+          folder: {"name": <on-disc name>, "children": [ ...same shape... ]}
+        A folder may be empty (no children / missing "children"). Names are the
+        names as they should appear ON THE DISC (already renamed by the GUI);
+        "src" is where to read a file's bytes from. This shares the exact same
+        authoring code as build(); only the way the node tree is populated
+        differs, so the proven layout/Joliet/extent logic is unchanged.
+        """
+        on_status("Building ISO image (ISO9660 + Joliet)...")
+        vol_id = (volume or "DATA_DISC").upper()[:32]
+        root = _Node("", True)
+
+        def add_desc(parent: _Node, desc: dict):
+            name = str(desc.get("name") or "").strip()
+            if not name:
+                return
+            children = desc.get("children")
+            is_dir = ("children" in desc) or (desc.get("is_dir") is True) or ("src" not in desc)
+            if is_dir:
+                node = _Node(name, True, None)
+                parent.children.append(node)
+                for child in (children or []):
+                    if isinstance(child, dict):
+                        add_desc(node, child)
+            else:
+                src = desc.get("src")
+                p = Path(src) if src is not None else None
+                node = _Node(name, False, p)
+                # _Node.size read the on-disk size via path; keep that.
+                parent.children.append(node)
+
+        for desc in (tree or []):
+            if isinstance(desc, dict):
+                add_desc(root, desc)
+
+        return self._author(root, out_iso, vol_id, on_status, on_log)
+
+    def _author(self, root: "_Node", out_iso: Path, vol_id: str,
+                on_status: OnStatus, on_log: OnLog) -> Path:
+        # This is the proven authoring pipeline shared by build() and
+        # build_tree(): assign names, lay out sectors, and write the image. It is
+        # unchanged from the original build(); only the tree construction above
+        # differs between the two entry points.
         all_dirs: List[_Node] = [root]
         root.iso_name = ""
         root.joliet_name = ""

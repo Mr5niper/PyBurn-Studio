@@ -186,17 +186,37 @@ class BurnWorker(QObject):
         """
         import sys as _sys
         import subprocess
+        import os
         o = self.job.options
 
         if getattr(_sys, "frozen", False):
             cmd = [_sys.executable, "cli-burn-data"]
         else:
-            import os
             script = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
                 os.path.abspath(__file__)))), "pyburn_studio.py")
             cmd = [_sys.executable, script, "cli-burn-data"]
-        for f in self.job.files:
-            cmd += ["--file", str(f)]
+        # If the Data tab composed an explicit disc layout (rename/new-folder/
+        # move), pass it as a JSON tree file and the child authors via
+        # build_tree(). Otherwise fall back to the flat --file list exactly as
+        # before, so the original path is untouched when no tree is supplied.
+        self._tree_tmp = None
+        disc_tree = getattr(o, "disc_tree", None)
+        if disc_tree:
+            import json, tempfile
+            try:
+                fd, tpath = tempfile.mkstemp(suffix=".json", prefix="pyburn_tree_",
+                                             dir=str(o.temp_dir))
+                with os.fdopen(fd, "w", encoding="utf-8") as tf:
+                    json.dump(disc_tree, tf)
+                self._tree_tmp = tpath
+                cmd += ["--tree", tpath]
+            except Exception as e:
+                self.sig_log.emit(f"Could not stage disc layout, using flat list: {e}")
+                for f in self.job.files:
+                    cmd += ["--file", str(f)]
+        else:
+            for f in self.job.files:
+                cmd += ["--file", str(f)]
         cmd += ["--device", str(self.job.device),
                 "--volume", str(o.volume_label or "DATA_DISC"),
                 "--temp-dir", str(o.temp_dir),
@@ -256,6 +276,15 @@ class BurnWorker(QObject):
             result_ok = (rc == 0)
             if not result_ok:
                 result_msg = f"Burn process exited with code {rc}"
+        # Remove the staged disc-layout temp file if we created one.
+        tt = getattr(self, "_tree_tmp", None)
+        if tt:
+            try:
+                import os as _os
+                _os.unlink(tt)
+            except Exception:
+                pass
+            self._tree_tmp = None
         self.sig_finished.emit(bool(result_ok), result_msg)
 
     def _cli_base_cmd(self, subcommand: str):

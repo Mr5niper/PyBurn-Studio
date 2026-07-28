@@ -10,6 +10,201 @@ from PyQt6.QtCore import QMimeData, pyqtSignal, Qt, QTimer, QUrl
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QDesktopServices
 from ..core.history import HistoryStore, HistoryEntry
 from datetime import datetime
+from PyQt6.QtWidgets import QTreeWidget, QTreeWidgetItem, QAbstractItemView
+
+
+# Roles stored on each disc-tree item.
+_ROLE_IS_DIR = Qt.ItemDataRole.UserRole + 1
+_ROLE_SRC = Qt.ItemDataRole.UserRole + 2
+
+
+class DiscTreeWidget(QTreeWidget):
+    """A folder-tree view of the disc being composed.
+
+    Each item is either a folder (may hold children, no source) or a file (a leaf
+    with a source path on disk). Item text is the ON-DISC name. Supports:
+      - dropping files/folders from the OS file manager into the root or a folder,
+      - moving items between folders by dragging inside the tree,
+      - exporting a description consumable by ISOBuilder.build_tree().
+    This widget only composes a layout; it never burns anything.
+    """
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setHeaderHidden(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setAcceptDrops(True)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+
+    # -- item helpers ---------------------------------------------------------
+    @staticmethod
+    def _is_dir(item: QTreeWidgetItem) -> bool:
+        return bool(item.data(0, _ROLE_IS_DIR))
+
+    def _make_item(self, name: str, is_dir: bool, src: str | None) -> QTreeWidgetItem:
+        it = QTreeWidgetItem([name])
+        it.setData(0, _ROLE_IS_DIR, is_dir)
+        it.setData(0, _ROLE_SRC, src)
+        flags = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsEditable
+        if is_dir:
+            flags |= Qt.ItemFlag.ItemIsDropEnabled
+        it.setFlags(flags)
+        return it
+
+    def _existing_names(self, parent: QTreeWidgetItem | None) -> set:
+        names = set()
+        if parent is None:
+            for i in range(self.topLevelItemCount()):
+                names.add(self.topLevelItem(i).text(0).lower())
+        else:
+            for i in range(parent.childCount()):
+                names.add(parent.child(i).text(0).lower())
+        return names
+
+    def _unique_name(self, base: str, parent: QTreeWidgetItem | None) -> str:
+        existing = self._existing_names(parent)
+        if base.lower() not in existing:
+            return base
+        stem, dot, ext = base.partition(".")
+        n = 1
+        while True:
+            cand = f"{stem} ({n}){dot}{ext}" if dot else f"{stem} ({n})"
+            if cand.lower() not in existing:
+                return cand
+            n += 1
+
+    def _add_disk_path(self, parent: QTreeWidgetItem | None, path: Path):
+        """Add a real file or folder (recursively) under parent (or root)."""
+        name = self._unique_name(path.name or str(path), parent)
+        if path.is_dir():
+            folder = self._make_item(name, True, None)
+            self._append(parent, folder)
+            try:
+                for child in sorted(path.iterdir(), key=lambda x: x.name.lower()):
+                    self._add_disk_path(folder, child)
+            except Exception:
+                pass
+        elif path.is_file():
+            self._append(parent, self._make_item(name, False, str(path)))
+
+    def _append(self, parent: QTreeWidgetItem | None, item: QTreeWidgetItem):
+        if parent is None:
+            self.addTopLevelItem(item)
+        else:
+            parent.addChild(item)
+            parent.setExpanded(True)
+
+    # -- public composition API ----------------------------------------------
+    def add_files(self, paths: list[str], parent: QTreeWidgetItem | None = None):
+        for p in paths:
+            self._add_disk_path(parent, Path(p))
+        self.changed.emit()
+
+    def add_folder_as_folder(self, path: str, parent: QTreeWidgetItem | None = None):
+        self._add_disk_path(parent, Path(path))
+        self.changed.emit()
+
+    def add_folder_contents(self, path: str, parent: QTreeWidgetItem | None = None):
+        folder = Path(path)
+        try:
+            for child in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
+                self._add_disk_path(parent, child)
+        except Exception:
+            pass
+        self.changed.emit()
+
+    def new_folder(self, parent: QTreeWidgetItem | None = None) -> QTreeWidgetItem:
+        name = self._unique_name("New Folder", parent)
+        it = self._make_item(name, True, None)
+        self._append(parent, it)
+        self.changed.emit()
+        return it
+
+    def remove_selected(self):
+        for it in list(self.selectedItems()):
+            parent = it.parent()
+            if parent is None:
+                idx = self.indexOfTopLevelItem(it)
+                if idx >= 0:
+                    self.takeTopLevelItem(idx)
+            else:
+                parent.removeChild(it)
+        self.changed.emit()
+
+    def clear_all(self):
+        self.clear()
+        self.changed.emit()
+
+    def export_tree(self) -> list:
+        """Serialize to the ISOBuilder.build_tree() description."""
+        def node(item: QTreeWidgetItem):
+            if self._is_dir(item):
+                return {"name": item.text(0),
+                        "children": [node(item.child(i)) for i in range(item.childCount())]}
+            return {"name": item.text(0), "src": item.data(0, _ROLE_SRC)}
+        return [node(self.topLevelItem(i)) for i in range(self.topLevelItemCount())]
+
+    def total_size(self) -> int:
+        """Sum of source file sizes currently in the tree (bytes)."""
+        total = 0
+        def walk(item: QTreeWidgetItem):
+            nonlocal total
+            if self._is_dir(item):
+                for i in range(item.childCount()):
+                    walk(item.child(i))
+            else:
+                src = item.data(0, _ROLE_SRC)
+                try:
+                    if src:
+                        total += Path(src).stat().st_size
+                except Exception:
+                    pass
+        for i in range(self.topLevelItemCount()):
+            walk(self.topLevelItem(i))
+        return total
+
+    def is_empty(self) -> bool:
+        return self.topLevelItemCount() == 0
+
+    # -- drag & drop ----------------------------------------------------------
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragMoveEvent(e)
+
+    def dropEvent(self, e):
+        md = e.mimeData()
+        if md.hasUrls():
+            # External drop from the OS file manager. Determine the target folder
+            # (a folder item under the cursor, else its parent, else root).
+            target = self.itemAt(e.position().toPoint()) if hasattr(e, "position") else self.itemAt(e.pos())
+            if target is not None and not self._is_dir(target):
+                target = target.parent()
+            for url in md.urls():
+                p = url.toLocalFile()
+                if p:
+                    self._add_disk_path(target, Path(p))
+            self.changed.emit()
+            e.acceptProposedAction()
+            return
+        # Internal move between folders. Only allow dropping into folders/root.
+        target = self.itemAt(e.position().toPoint()) if hasattr(e, "position") else self.itemAt(e.pos())
+        if target is not None and not self._is_dir(target):
+            # Dropping onto a file: redirect into its parent folder/root.
+            e.setDropAction(Qt.DropAction.MoveAction)
+        super().dropEvent(e)
+        self.changed.emit()
+
 
 
 def compute_total_size(paths: List[str], max_files: int = 50000) -> int:
