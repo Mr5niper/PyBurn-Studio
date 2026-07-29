@@ -52,9 +52,17 @@ class DiscTreeWidget(QTreeWidget):
         # Give rows enough height that the inline rename editor is not clipped.
         self.setUniformRowHeights(True)
         self._row_height = 24
-        # Auto-scroll while dragging near the top/bottom edge.
-        self.setAutoScroll(True)
-        self.setAutoScrollMargin(24)
+        # Custom drag auto-scroll: the built-in only scrolls inside the widget at
+        # a fixed rate. We disable it and drive our own timer so scrolling
+        # continues when the cursor goes PAST the top/bottom edge and speeds up
+        # the further past the edge it is (Windows-style).
+        self.setAutoScroll(False)
+        from PyQt6.QtCore import QTimer
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setInterval(30)  # ~33 Hz
+        self._scroll_timer.timeout.connect(self._drag_scroll_tick)
+        self._scroll_speed = 0.0            # rows/sec-ish, sign = direction
+        self._drop_row_y = None             # y of the drop-indicator line, or None
 
     # -- item helpers ---------------------------------------------------------
     @staticmethod
@@ -241,6 +249,9 @@ class DiscTreeWidget(QTreeWidget):
 
     # -- context menu / clipboard --------------------------------------------
     def _context_menu(self, point):
+        # Never open a menu while a drag-scroll is active; it would interrupt.
+        if self._scroll_timer.isActive() or self._dragging:
+            return
         item = self.itemAt(point)
         menu = QMenu(self)
         act_newfolder = menu.addAction("New Folder")
@@ -368,8 +379,8 @@ class DiscTreeWidget(QTreeWidget):
 
     # -- drag & drop ----------------------------------------------------------
     def startDrag(self, supportedActions):
-        # Record what is being dragged and run the drag as a Copy action so Qt's
-        # view does NOT remove the source rows itself (we do the move in
+        # Record what is being dragged and run the drag as a Move we control so
+        # Qt's view does NOT remove the source rows itself (we do the move in
         # dropEvent). This is what stops dragged items from disappearing.
         self._dragging = list(self.selectedItems())
         from PyQt6.QtGui import QDrag
@@ -378,7 +389,123 @@ class DiscTreeWidget(QTreeWidget):
         mime = QMimeData()
         mime.setData("application/x-pyburn-disc-node", b"1")
         drag.setMimeData(mime)
-        drag.exec(Qt.DropAction.MoveAction)
+        # Suppress tooltips for the duration of the drag so no popup can steal
+        # focus or interrupt the scroll/drag.
+        self._begin_drag_ui()
+        try:
+            drag.exec(Qt.DropAction.MoveAction)
+        finally:
+            self._end_drag_ui()
+
+    def _begin_drag_ui(self):
+        self._prev_tooltips = None
+        try:
+            # Disable tooltips on the tree while dragging.
+            self.setToolTip("")
+        except Exception:
+            pass
+
+    def _end_drag_ui(self):
+        self._stop_drag_scroll()
+        self._set_drop_line(None)
+
+    # -- accelerating auto-scroll (continues past the edge) -------------------
+    def _update_drag_scroll_from_cursor(self):
+        """Compute scroll speed from how far the cursor is past the top/bottom
+        edge of the viewport. Uses the GLOBAL cursor position so it keeps working
+        when the pointer moves outside the widget."""
+        from PyQt6.QtGui import QCursor
+        vp = self.viewport()
+        top_left = vp.mapToGlobal(vp.rect().topLeft())
+        h = vp.rect().height()
+        gy = QCursor.pos().y()
+        rel = gy - top_left.y()          # cursor y relative to viewport top
+        margin = 28                      # start scrolling within this band
+        speed = 0.0
+        if rel < margin:
+            # Above the top (or near it). Distance grows as we go past the edge.
+            dist = (margin - rel)
+            speed = -dist
+        elif rel > h - margin:
+            dist = (rel - (h - margin))
+            speed = dist
+        # Scale: pixels-per-tick, accelerating with distance, with a sane cap.
+        # dist can exceed the widget once the cursor is past the edge, which is
+        # exactly how we go faster the further out you drag.
+        if speed != 0.0:
+            step = max(1.0, min(abs(speed) * 0.6, 80.0))
+            self._scroll_speed = step if speed > 0 else -step
+            if not self._scroll_timer.isActive():
+                self._scroll_timer.start()
+        else:
+            self._stop_drag_scroll()
+
+    def _drag_scroll_tick(self):
+        bar = self.verticalScrollBar()
+        if self._scroll_speed == 0.0:
+            return
+        newv = bar.value() + int(self._scroll_speed)
+        newv = max(bar.minimum(), min(bar.maximum(), newv))
+        bar.setValue(newv)
+        # Keep the drop indicator in sync while the view scrolls under the cursor.
+        self._update_drop_line_from_cursor()
+
+    def _stop_drag_scroll(self):
+        self._scroll_speed = 0.0
+        if self._scroll_timer.isActive():
+            self._scroll_timer.stop()
+
+    # -- drop indicator line --------------------------------------------------
+    def _set_drop_line(self, y):
+        if self._drop_row_y != y:
+            self._drop_row_y = y
+            self.viewport().update()
+
+    def _update_drop_line_from_cursor(self):
+        from PyQt6.QtGui import QCursor
+        vp = self.viewport()
+        pt = vp.mapFromGlobal(QCursor.pos())
+        self._compute_drop_line(pt)
+
+    def _compute_drop_line(self, pos):
+        """Set the drop-indicator line: if over a folder, highlight (line at its
+        bottom); otherwise a line between rows where the item would land."""
+        item = self.itemAt(pos)
+        if item is None:
+            # Empty space: line at the bottom of the last visible row / top.
+            self._set_drop_line(self._content_bottom_y())
+            return
+        rect = self.visualItemRect(item)
+        if self._is_dir(item):
+            # Dropping into the folder: draw the line across the folder row.
+            self._set_drop_line(rect.center().y())
+        else:
+            # Between rows: above or below the file depending on cursor half.
+            if pos.y() < rect.center().y():
+                self._set_drop_line(rect.top())
+            else:
+                self._set_drop_line(rect.bottom())
+
+    def _content_bottom_y(self):
+        n = self.topLevelItemCount()
+        if n == 0:
+            return 0
+        last = self.topLevelItem(n - 1)
+        return self.visualItemRect(last).bottom()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if self._drop_row_y is None:
+            return
+        from PyQt6.QtGui import QPainter, QPen, QColor
+        painter = QPainter(self.viewport())
+        pen = QPen(QColor(80, 160, 255))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        w = self.viewport().width()
+        y = int(self._drop_row_y)
+        painter.drawLine(2, y, w - 2, y)
+        painter.end()
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls() or e.source() is self:
@@ -386,12 +513,17 @@ class DiscTreeWidget(QTreeWidget):
         else:
             super().dragEnterEvent(e)
 
+    def dragLeaveEvent(self, e):
+        # Do NOT stop scrolling here: leaving the widget is exactly when we want
+        # to keep scrolling (cursor past the edge). Only clear the drop line.
+        self._set_drop_line(None)
+        super().dragLeaveEvent(e)
+
     def dragMoveEvent(self, e):
         if e.mimeData().hasUrls() or e.source() is self:
-            # Let the base view compute and paint the drop indicator, then accept
-            # so the drop is allowed. Without calling super the indicator line
-            # never appears.
-            super().dragMoveEvent(e)
+            pos = e.position().toPoint() if hasattr(e, "position") else e.pos()
+            self._compute_drop_line(pos)
+            self._update_drag_scroll_from_cursor()
             e.acceptProposedAction()
         else:
             super().dragMoveEvent(e)
@@ -406,6 +538,9 @@ class DiscTreeWidget(QTreeWidget):
         return target
 
     def dropEvent(self, e):
+        # Dropping ends the drag: stop the custom scroll and clear the indicator.
+        self._stop_drag_scroll()
+        self._set_drop_line(None)
         md = e.mimeData()
         pos = e.position().toPoint() if hasattr(e, "position") else e.pos()
         dest = self._drop_dest(pos)
@@ -458,7 +593,6 @@ class DiscTreeWidget(QTreeWidget):
                 self.addTopLevelItem(taken)
             else:
                 dest.addChild(taken)
-                dest.setExpanded(True)
             last = taken
         if last is not None:
             self.setCurrentItem(last)
