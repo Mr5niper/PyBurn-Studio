@@ -62,7 +62,10 @@ class DiscTreeWidget(QTreeWidget):
         self._scroll_timer.setInterval(30)  # ~33 Hz
         self._scroll_timer.timeout.connect(self._drag_scroll_tick)
         self._scroll_speed = 0.0            # rows/sec-ish, sign = direction
-        self._drop_row_y = None             # y of the drop-indicator line, or None
+        self._hl_item = None                # folder currently highlighted as drop target
+        # A band at the very top and bottom of the viewport always means "drop to
+        # the disc ROOT", so root drops are easy even when the tree is full.
+        self._root_band = 22
 
     # -- item helpers ---------------------------------------------------------
     @staticmethod
@@ -407,7 +410,7 @@ class DiscTreeWidget(QTreeWidget):
 
     def _end_drag_ui(self):
         self._stop_drag_scroll()
-        self._set_drop_line(None)
+        self._set_highlight(None)
 
     # -- accelerating auto-scroll (continues past the edge) -------------------
     def _update_drag_scroll_from_cursor(self):
@@ -447,64 +450,64 @@ class DiscTreeWidget(QTreeWidget):
         newv = bar.value() + int(self._scroll_speed)
         newv = max(bar.minimum(), min(bar.maximum(), newv))
         bar.setValue(newv)
-        # Keep the drop indicator in sync while the view scrolls under the cursor.
-        self._update_drop_line_from_cursor()
+        # Keep the drop highlight in sync while the view scrolls under the cursor.
+        self._update_drop_target_from_cursor()
 
     def _stop_drag_scroll(self):
         self._scroll_speed = 0.0
         if self._scroll_timer.isActive():
             self._scroll_timer.stop()
 
-    # -- drop indicator line --------------------------------------------------
-    def _set_drop_line(self, y):
-        if self._drop_row_y != y:
-            self._drop_row_y = y
+    # -- drop target highlight (folder-into vs root) --------------------------
+    def _set_highlight(self, item):
+        if self._hl_item is not item:
+            self._hl_item = item
             self.viewport().update()
 
-    def _update_drop_line_from_cursor(self):
+    def _update_drop_target_from_cursor(self):
         from PyQt6.QtGui import QCursor
         vp = self.viewport()
         pt = vp.mapFromGlobal(QCursor.pos())
-        self._compute_drop_line(pt)
+        self._compute_drop_target(pt)
 
-    def _compute_drop_line(self, pos):
-        """Set the drop-indicator line: if over a folder, highlight (line at its
-        bottom); otherwise a line between rows where the item would land."""
+    def _drop_dest_folder(self, pos):
+        """The folder an item would drop INTO for a hover at pos, or None for the
+        root. Over a folder row -> that folder; over a file -> its parent folder;
+        empty space, or the top/bottom root band over non-folder space -> root."""
         item = self.itemAt(pos)
+        # A folder directly under the cursor always wins (drop into it), even if
+        # it happens to sit within the top/bottom band.
+        if item is not None and self._is_dir(item):
+            return item
+        h = self.viewport().rect().height()
+        if pos.y() <= self._root_band or pos.y() >= h - self._root_band:
+            return None  # band over empty/file space: the disc root
         if item is None:
-            # Empty space: line at the bottom of the last visible row / top.
-            self._set_drop_line(self._content_bottom_y())
-            return
-        rect = self.visualItemRect(item)
-        if self._is_dir(item):
-            # Dropping into the folder: draw the line across the folder row.
-            self._set_drop_line(rect.center().y())
-        else:
-            # Between rows: above or below the file depending on cursor half.
-            if pos.y() < rect.center().y():
-                self._set_drop_line(rect.top())
-            else:
-                self._set_drop_line(rect.bottom())
+            return None
+        return item.parent()  # a file: its parent folder, or None at root
 
-    def _content_bottom_y(self):
-        n = self.topLevelItemCount()
-        if n == 0:
-            return 0
-        last = self.topLevelItem(n - 1)
-        return self.visualItemRect(last).bottom()
+    def _compute_drop_target(self, pos):
+        dest = self._drop_dest_folder(pos)
+        # Highlight the destination folder (or nothing when dropping to root).
+        self._set_highlight(dest)
 
     def paintEvent(self, e):
         super().paintEvent(e)
-        if self._drop_row_y is None:
+        item = self._hl_item
+        if item is None:
             return
-        from PyQt6.QtGui import QPainter, QPen, QColor
+        rect = self.visualItemRect(item)
+        if not rect.isValid() or rect.height() <= 0:
+            return
+        from PyQt6.QtGui import QPainter, QPen, QColor, QBrush
         painter = QPainter(self.viewport())
+        w = self.viewport().width()
+        fill = QColor(80, 160, 255, 60)     # translucent highlight
+        painter.fillRect(2, rect.top(), w - 4, rect.height(), QBrush(fill))
         pen = QPen(QColor(80, 160, 255))
         pen.setWidth(2)
         painter.setPen(pen)
-        w = self.viewport().width()
-        y = int(self._drop_row_y)
-        painter.drawLine(2, y, w - 2, y)
+        painter.drawRect(2, rect.top(), w - 4, rect.height() - 1)
         painter.end()
 
     def dragEnterEvent(self, e):
@@ -515,35 +518,26 @@ class DiscTreeWidget(QTreeWidget):
 
     def dragLeaveEvent(self, e):
         # Do NOT stop scrolling here: leaving the widget is exactly when we want
-        # to keep scrolling (cursor past the edge). Only clear the drop line.
-        self._set_drop_line(None)
+        # to keep scrolling (cursor past the edge). Only clear the highlight.
+        self._set_highlight(None)
         super().dragLeaveEvent(e)
 
     def dragMoveEvent(self, e):
         if e.mimeData().hasUrls() or e.source() is self:
             pos = e.position().toPoint() if hasattr(e, "position") else e.pos()
-            self._compute_drop_line(pos)
+            self._compute_drop_target(pos)
             self._update_drag_scroll_from_cursor()
             e.acceptProposedAction()
         else:
             super().dragMoveEvent(e)
 
-    def _drop_dest(self, pos):
-        """Resolve the destination folder for a drop at pos: a folder under the
-        cursor is the destination; a file targets its parent; empty space targets
-        the root (None)."""
-        target = self.itemAt(pos)
-        if target is not None and not self._is_dir(target):
-            return target.parent()
-        return target
-
     def dropEvent(self, e):
-        # Dropping ends the drag: stop the custom scroll and clear the indicator.
+        # Dropping ends the drag: stop the custom scroll and clear the highlight.
         self._stop_drag_scroll()
-        self._set_drop_line(None)
+        self._set_highlight(None)
         md = e.mimeData()
         pos = e.position().toPoint() if hasattr(e, "position") else e.pos()
-        dest = self._drop_dest(pos)
+        dest = self._drop_dest_folder(pos)
 
         # External drop from the OS file manager.
         if md.hasUrls():
