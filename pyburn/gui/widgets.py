@@ -46,6 +46,9 @@ class DiscTreeWidget(QTreeWidget):
         self.customContextMenuRequested.connect(self._context_menu)
         self._clipboard = []      # copied disc-node descriptions for paste
         self._dragging = []       # items currently being dragged (internal move)
+        self._sorting = False     # guard so re-sort does not recurse via signals
+        # Re-sort when an item is renamed via the inline editor.
+        self.itemChanged.connect(self._on_item_changed)
         # Give rows enough height that the inline rename editor is not clipped.
         self.setUniformRowHeights(True)
         self._row_height = 24
@@ -108,16 +111,65 @@ class DiscTreeWidget(QTreeWidget):
             self.addTopLevelItem(item)
         else:
             parent.addChild(item)
-            parent.setExpanded(True)
+        # Do NOT auto-expand; let the user open folders themselves.
+
+    def _sort_key(self, item: QTreeWidgetItem):
+        # Folders first (0), then files (1); then case-insensitive name.
+        return (0 if self._is_dir(item) else 1, item.text(0).lower())
+
+    def _sort_container(self, parent: QTreeWidgetItem | None):
+        """Re-sort the direct children of parent (or the top level) in place:
+        folders first, then files, alphabetical within each group. Recurses into
+        subfolders. Preserves expansion state and the current selection."""
+        if parent is None:
+            items = [self.takeTopLevelItem(0) for _ in range(self.topLevelItemCount())]
+            items.sort(key=self._sort_key)
+            for it in items:
+                self.addTopLevelItem(it)
+            for it in items:
+                if self._is_dir(it):
+                    self._sort_container(it)
+        else:
+            expanded = parent.isExpanded()
+            children = [parent.takeChild(0) for _ in range(parent.childCount())]
+            children.sort(key=self._sort_key)
+            for c in children:
+                parent.addChild(c)
+            for c in children:
+                if self._is_dir(c):
+                    self._sort_container(c)
+            parent.setExpanded(expanded)
+
+    def _resort(self):
+        """Re-sort the entire tree, preserving expansion and selection."""
+        if self._sorting:
+            return
+        self._sorting = True
+        try:
+            cur = self.currentItem()
+            self._sort_container(None)
+            if cur is not None:
+                self.setCurrentItem(cur)
+        finally:
+            self._sorting = False
+
+    def _on_item_changed(self, item, column):
+        # A rename (inline edit) changed the text; keep ordering correct.
+        if self._sorting:
+            return
+        self._resort()
+        self.changed.emit()
 
     # -- public composition API ----------------------------------------------
     def add_files(self, paths: list[str], parent: QTreeWidgetItem | None = None):
         for p in paths:
             self._add_disk_path(parent, Path(p))
+        self._resort()
         self.changed.emit()
 
     def add_folder_as_folder(self, path: str, parent: QTreeWidgetItem | None = None):
         self._add_disk_path(parent, Path(path))
+        self._resort()
         self.changed.emit()
 
     def add_folder_contents(self, path: str, parent: QTreeWidgetItem | None = None):
@@ -127,12 +179,14 @@ class DiscTreeWidget(QTreeWidget):
                 self._add_disk_path(parent, child)
         except Exception:
             pass
+        self._resort()
         self.changed.emit()
 
     def new_folder(self, parent: QTreeWidgetItem | None = None) -> QTreeWidgetItem:
         name = self._unique_name("New Folder", parent)
         it = self._make_item(name, True, None)
         self._append(parent, it)
+        self._resort()
         self.changed.emit()
         return it
 
@@ -306,6 +360,7 @@ class DiscTreeWidget(QTreeWidget):
                 self._append(parent, node)
         for desc in self._clipboard:
             add_desc(dest, desc)
+        self._resort()
         self.changed.emit()
 
     # -- drag & drop ----------------------------------------------------------
@@ -330,6 +385,10 @@ class DiscTreeWidget(QTreeWidget):
 
     def dragMoveEvent(self, e):
         if e.mimeData().hasUrls() or e.source() is self:
+            # Let the base view compute and paint the drop indicator, then accept
+            # so the drop is allowed. Without calling super the indicator line
+            # never appears.
+            super().dragMoveEvent(e)
             e.acceptProposedAction()
         else:
             super().dragMoveEvent(e)
@@ -354,6 +413,7 @@ class DiscTreeWidget(QTreeWidget):
                 p = url.toLocalFile()
                 if p:
                     self._add_disk_path(dest, Path(p))
+            self._resort()
             self.changed.emit()
             e.acceptProposedAction()
             return
@@ -399,6 +459,7 @@ class DiscTreeWidget(QTreeWidget):
             last = taken
         if last is not None:
             self.setCurrentItem(last)
+        self._resort()
         self.changed.emit()
         e.acceptProposedAction()
 
