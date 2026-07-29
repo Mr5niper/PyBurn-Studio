@@ -34,13 +34,18 @@ class DiscTreeWidget(QTreeWidget):
         super().__init__(parent)
         self.setHeaderHidden(True)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        # We manage internal moves ourselves (see startDrag/dropEvent), so use
+        # DragDrop (not InternalMove) and never let Qt's model perform the move,
+        # which was removing the source row and making dragged items vanish.
+        self.setDragEnabled(True)
         self.setAcceptDrops(True)
-        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDropIndicatorShown(True)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._context_menu)
-        self._clipboard = []  # copied disc-node descriptions for paste
+        self._clipboard = []      # copied disc-node descriptions for paste
+        self._dragging = []       # items currently being dragged (internal move)
         # Give rows enough height that the inline rename editor is not clipped.
         self.setUniformRowHeights(True)
         self._row_height = 24
@@ -304,30 +309,46 @@ class DiscTreeWidget(QTreeWidget):
         self.changed.emit()
 
     # -- drag & drop ----------------------------------------------------------
+    def startDrag(self, supportedActions):
+        # Record what is being dragged and run the drag as a Copy action so Qt's
+        # view does NOT remove the source rows itself (we do the move in
+        # dropEvent). This is what stops dragged items from disappearing.
+        self._dragging = list(self.selectedItems())
+        from PyQt6.QtGui import QDrag
+        from PyQt6.QtCore import QMimeData
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData("application/x-pyburn-disc-node", b"1")
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.MoveAction)
+
     def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls():
+        if e.mimeData().hasUrls() or e.source() is self:
             e.acceptProposedAction()
         else:
             super().dragEnterEvent(e)
 
     def dragMoveEvent(self, e):
-        if e.mimeData().hasUrls():
+        if e.mimeData().hasUrls() or e.source() is self:
             e.acceptProposedAction()
         else:
             super().dragMoveEvent(e)
 
+    def _drop_dest(self, pos):
+        """Resolve the destination folder for a drop at pos: a folder under the
+        cursor is the destination; a file targets its parent; empty space targets
+        the root (None)."""
+        target = self.itemAt(pos)
+        if target is not None and not self._is_dir(target):
+            return target.parent()
+        return target
+
     def dropEvent(self, e):
         md = e.mimeData()
         pos = e.position().toPoint() if hasattr(e, "position") else e.pos()
-        target = self.itemAt(pos)
-        # Resolve the destination folder: a folder under the cursor is the
-        # destination; dropping onto a file targets that file's parent; dropping
-        # onto empty space targets the root (None).
-        if target is not None and not self._is_dir(target):
-            dest = target.parent()
-        else:
-            dest = target  # a folder, or None for empty space (root)
+        dest = self._drop_dest(pos)
 
+        # External drop from the OS file manager.
         if md.hasUrls():
             for url in md.urls():
                 p = url.toLocalFile()
@@ -337,10 +358,13 @@ class DiscTreeWidget(QTreeWidget):
             e.acceptProposedAction()
             return
 
-        # Internal move: reparent the selected items into dest (or root). Done
-        # explicitly so items can move OUT to the root, not just into folders.
-        moving = [it for it in self.selectedItems()]
-        # Guard against dropping a folder into itself or its own descendant.
+        # Internal move of the recorded dragged items.
+        moving = self._dragging or list(self.selectedItems())
+        self._dragging = []
+        if not moving:
+            e.ignore()
+            return
+
         def is_descendant(node, maybe_ancestor):
             p = node.parent()
             while p is not None:
@@ -348,25 +372,33 @@ class DiscTreeWidget(QTreeWidget):
                     return True
                 p = p.parent()
             return False
+
+        # Reject illegal moves (into self or own descendant); keep the rest.
+        valid = []
         for it in moving:
             if dest is it or (dest is not None and is_descendant(dest, it)):
-                e.ignore()
-                return
-        for it in moving:
+                continue
+            valid.append(it)
+        if not valid:
+            e.ignore()
+            return
+
+        last = None
+        for it in valid:
             parent = it.parent()
             if parent is None:
-                idx = self.indexOfTopLevelItem(it)
-                taken = self.takeTopLevelItem(idx)
+                taken = self.takeTopLevelItem(self.indexOfTopLevelItem(it))
             else:
                 taken = parent.takeChild(parent.indexOfChild(it))
-            # Ensure a unique name in the destination.
             taken.setText(0, self._unique_name(taken.text(0), dest))
             if dest is None:
                 self.addTopLevelItem(taken)
             else:
                 dest.addChild(taken)
                 dest.setExpanded(True)
-            self.setCurrentItem(taken)
+            last = taken
+        if last is not None:
+            self.setCurrentItem(last)
         self.changed.emit()
         e.acceptProposedAction()
 
