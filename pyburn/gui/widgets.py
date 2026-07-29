@@ -10,7 +10,7 @@ from PyQt6.QtCore import QMimeData, pyqtSignal, Qt, QTimer, QUrl
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QDesktopServices
 from ..core.history import HistoryStore, HistoryEntry
 from datetime import datetime
-from PyQt6.QtWidgets import QTreeWidget, QTreeWidgetItem, QAbstractItemView
+from PyQt6.QtWidgets import QTreeWidget, QTreeWidgetItem, QAbstractItemView, QMenu
 
 
 # Roles stored on each disc-tree item.
@@ -38,6 +38,12 @@ class DiscTreeWidget(QTreeWidget):
         self.setAcceptDrops(True)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._context_menu)
+        self._clipboard = []  # copied disc-node descriptions for paste
+        # Give rows enough height that the inline rename editor is not clipped.
+        self.setUniformRowHeights(True)
+        self._row_height = 24
 
     # -- item helpers ---------------------------------------------------------
     @staticmethod
@@ -52,6 +58,8 @@ class DiscTreeWidget(QTreeWidget):
         if is_dir:
             flags |= Qt.ItemFlag.ItemIsDropEnabled
         it.setFlags(flags)
+        from PyQt6.QtCore import QSize
+        it.setSizeHint(0, QSize(0, self._row_height))
         return it
 
     def _existing_names(self, parent: QTreeWidgetItem | None) -> set:
@@ -169,6 +177,132 @@ class DiscTreeWidget(QTreeWidget):
     def is_empty(self) -> bool:
         return self.topLevelItemCount() == 0
 
+    # -- context menu / clipboard --------------------------------------------
+    def _context_menu(self, point):
+        item = self.itemAt(point)
+        menu = QMenu(self)
+        act_newfolder = menu.addAction("New Folder")
+        act_rename = menu.addAction("Rename")
+        act_remove = menu.addAction("Remove")
+        menu.addSeparator()
+        act_copy = menu.addAction("Copy")
+        act_paste = menu.addAction("Paste")
+        menu.addSeparator()
+        act_open = menu.addAction("Open in Explorer")
+
+        has_sel = len(self.selectedItems()) > 0
+        act_rename.setEnabled(item is not None)
+        act_remove.setEnabled(has_sel)
+        act_copy.setEnabled(has_sel)
+        act_paste.setEnabled(bool(self._clipboard))
+        # Open in Explorer only makes sense for a node that maps to a real disk
+        # path (a file's source, or a folder that came from disk).
+        open_path = self._explorer_path(item) if item is not None else None
+        act_open.setEnabled(open_path is not None)
+
+        chosen = menu.exec(self.viewport().mapToGlobal(point))
+        if chosen is None:
+            return
+        if chosen is act_newfolder:
+            dest = item if (item is not None and self._is_dir(item)) else (item.parent() if item is not None else None)
+            it = self.new_folder(dest)
+            self.setCurrentItem(it)
+            self.editItem(it, 0)
+        elif chosen is act_rename and item is not None:
+            self.editItem(item, 0)
+        elif chosen is act_remove:
+            self.remove_selected()
+        elif chosen is act_copy:
+            self._copy_selected()
+        elif chosen is act_paste:
+            dest = item if (item is not None and self._is_dir(item)) else (item.parent() if item is not None else None)
+            self._paste(dest)
+        elif chosen is act_open and open_path is not None:
+            self._open_in_explorer(open_path)
+
+    def _explorer_path(self, item: QTreeWidgetItem):
+        """Return a real disk path to reveal for this item, or None. Files reveal
+        their source; disk-derived folders reveal their source if we can infer
+        it from a child file. GUI-created folders have no disk path."""
+        if item is None:
+            return None
+        if not self._is_dir(item):
+            src = item.data(0, _ROLE_SRC)
+            return src if src else None
+        # Folder: try to find a descendant file's source and reveal its folder.
+        def first_src(node):
+            for i in range(node.childCount()):
+                c = node.child(i)
+                if self._is_dir(c):
+                    r = first_src(c)
+                    if r:
+                        return r
+                else:
+                    s = c.data(0, _ROLE_SRC)
+                    if s:
+                        return s
+            return None
+        s = first_src(item)
+        if s:
+            return str(Path(s).parent)
+        return None
+
+    def _open_in_explorer(self, path: str):
+        import subprocess, sys, os as _os
+        p = Path(path)
+        try:
+            if sys.platform.startswith("win"):
+                if p.is_dir():
+                    _os.startfile(str(p))  # type: ignore[attr-defined]
+                else:
+                    subprocess.Popen(["explorer", "/select,", str(p)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", str(p)] if p.exists() else ["open", str(p.parent)])
+            else:
+                target = str(p if p.is_dir() else p.parent)
+                subprocess.Popen(["xdg-open", target])
+        except Exception:
+            pass
+
+    def _node_desc(self, item: QTreeWidgetItem):
+        if self._is_dir(item):
+            return {"name": item.text(0),
+                    "children": [self._node_desc(item.child(i)) for i in range(item.childCount())]}
+        return {"name": item.text(0), "src": item.data(0, _ROLE_SRC), "is_dir": False}
+
+    def _copy_selected(self):
+        # Copy only top-most selected items (avoid duplicating a child whose
+        # parent is also selected). QTreeWidgetItem is not hashable, so compare
+        # by identity against the selection list.
+        sel = self.selectedItems()
+        tops = []
+        for it in sel:
+            p = it.parent()
+            skip = False
+            while p is not None:
+                if any(p is s for s in sel):
+                    skip = True
+                    break
+                p = p.parent()
+            if not skip:
+                tops.append(it)
+        self._clipboard = [self._node_desc(it) for it in tops]
+
+    def _paste(self, dest: QTreeWidgetItem | None):
+        def add_desc(parent, desc):
+            name = self._unique_name(desc["name"], parent)
+            if desc.get("children") is not None or ("src" not in desc):
+                node = self._make_item(name, True, None)
+                self._append(parent, node)
+                for ch in desc.get("children", []):
+                    add_desc(node, ch)
+            else:
+                node = self._make_item(name, False, desc.get("src"))
+                self._append(parent, node)
+        for desc in self._clipboard:
+            add_desc(dest, desc)
+        self.changed.emit()
+
     # -- drag & drop ----------------------------------------------------------
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
@@ -184,26 +318,57 @@ class DiscTreeWidget(QTreeWidget):
 
     def dropEvent(self, e):
         md = e.mimeData()
+        pos = e.position().toPoint() if hasattr(e, "position") else e.pos()
+        target = self.itemAt(pos)
+        # Resolve the destination folder: a folder under the cursor is the
+        # destination; dropping onto a file targets that file's parent; dropping
+        # onto empty space targets the root (None).
+        if target is not None and not self._is_dir(target):
+            dest = target.parent()
+        else:
+            dest = target  # a folder, or None for empty space (root)
+
         if md.hasUrls():
-            # External drop from the OS file manager. Determine the target folder
-            # (a folder item under the cursor, else its parent, else root).
-            target = self.itemAt(e.position().toPoint()) if hasattr(e, "position") else self.itemAt(e.pos())
-            if target is not None and not self._is_dir(target):
-                target = target.parent()
             for url in md.urls():
                 p = url.toLocalFile()
                 if p:
-                    self._add_disk_path(target, Path(p))
+                    self._add_disk_path(dest, Path(p))
             self.changed.emit()
             e.acceptProposedAction()
             return
-        # Internal move between folders. Only allow dropping into folders/root.
-        target = self.itemAt(e.position().toPoint()) if hasattr(e, "position") else self.itemAt(e.pos())
-        if target is not None and not self._is_dir(target):
-            # Dropping onto a file: redirect into its parent folder/root.
-            e.setDropAction(Qt.DropAction.MoveAction)
-        super().dropEvent(e)
+
+        # Internal move: reparent the selected items into dest (or root). Done
+        # explicitly so items can move OUT to the root, not just into folders.
+        moving = [it for it in self.selectedItems()]
+        # Guard against dropping a folder into itself or its own descendant.
+        def is_descendant(node, maybe_ancestor):
+            p = node.parent()
+            while p is not None:
+                if p is maybe_ancestor:
+                    return True
+                p = p.parent()
+            return False
+        for it in moving:
+            if dest is it or (dest is not None and is_descendant(dest, it)):
+                e.ignore()
+                return
+        for it in moving:
+            parent = it.parent()
+            if parent is None:
+                idx = self.indexOfTopLevelItem(it)
+                taken = self.takeTopLevelItem(idx)
+            else:
+                taken = parent.takeChild(parent.indexOfChild(it))
+            # Ensure a unique name in the destination.
+            taken.setText(0, self._unique_name(taken.text(0), dest))
+            if dest is None:
+                self.addTopLevelItem(taken)
+            else:
+                dest.addChild(taken)
+                dest.setExpanded(True)
+            self.setCurrentItem(taken)
         self.changed.emit()
+        e.acceptProposedAction()
 
 
 
