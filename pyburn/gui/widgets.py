@@ -52,6 +52,9 @@ class DiscTreeWidget(QTreeWidget):
         # Give rows enough height that the inline rename editor is not clipped.
         self.setUniformRowHeights(True)
         self._row_height = 24
+        # Auto-scroll while dragging near the top/bottom edge.
+        self.setAutoScroll(True)
+        self.setAutoScrollMargin(24)
 
     # -- item helpers ---------------------------------------------------------
     @staticmethod
