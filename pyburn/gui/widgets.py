@@ -63,9 +63,21 @@ class DiscTreeWidget(QTreeWidget):
         self._scroll_timer.timeout.connect(self._drag_scroll_tick)
         self._scroll_speed = 0.0            # rows/sec-ish, sign = direction
         self._hl_item = None                # folder currently highlighted as drop target
-        # A band at the very top and bottom of the viewport always means "drop to
-        # the disc ROOT", so root drops are easy even when the tree is full.
-        self._root_band = 22
+        # Blank space before the first item and after the last item, inside the
+        # tree content. Drops in this blank space hit empty space -> disc root,
+        # so root drops always have somewhere to land. Implemented as content
+        # padding on the tree, so it scrolls with the items and is not a fixed
+        # permanent band.
+        self._pad = 12
+        self.setStyleSheet(
+            "QTreeWidget {"
+            "  background-color: #3b4261;"
+            "  border: 1px solid #414868;"
+            "  border-radius: 4px;"
+            "  selection-background-color: #7aa2f7;"
+            "  padding-top: %dpx; padding-bottom: %dpx;"
+            "}" % (self._pad, self._pad)
+        )
 
     # -- item helpers ---------------------------------------------------------
     @staticmethod
@@ -473,17 +485,13 @@ class DiscTreeWidget(QTreeWidget):
     def _drop_dest_folder(self, pos):
         """The folder an item would drop INTO for a hover at pos, or None for the
         root. Over a folder row -> that folder; over a file -> its parent folder;
-        empty space, or the top/bottom root band over non-folder space -> root."""
+        empty space (including the blank padding before the first / after the
+        last item) -> root."""
         item = self.itemAt(pos)
-        # A folder directly under the cursor always wins (drop into it), even if
-        # it happens to sit within the top/bottom band.
-        if item is not None and self._is_dir(item):
-            return item
-        h = self.viewport().rect().height()
-        if pos.y() <= self._root_band or pos.y() >= h - self._root_band:
-            return None  # band over empty/file space: the disc root
         if item is None:
             return None
+        if self._is_dir(item):
+            return item
         return item.parent()  # a file: its parent folder, or None at root
 
     def _compute_drop_target(self, pos):
