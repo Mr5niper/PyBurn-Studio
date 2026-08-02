@@ -225,6 +225,8 @@ class BurnWorker(QObject):
             cmd += ["--auto-blank"]
         if o.eject_after:
             cmd += ["--eject"]
+        if getattr(o, "verify", False):
+            cmd += ["--verify"]
         if getattr(o, "dummy", False):
             cmd += ["--dummy"]
 
