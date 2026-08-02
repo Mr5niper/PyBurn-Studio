@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import QTreeWidget, QTreeWidgetItem, QAbstractItemView, QMe
 # Roles stored on each disc-tree item.
 _ROLE_IS_DIR = Qt.ItemDataRole.UserRole + 1
 _ROLE_SRC = Qt.ItemDataRole.UserRole + 2
+_ROLE_SPACER = Qt.ItemDataRole.UserRole + 3
 
 
 class DiscTreeWidget(QTreeWidget):
@@ -49,8 +50,9 @@ class DiscTreeWidget(QTreeWidget):
         self._sorting = False     # guard so re-sort does not recurse via signals
         # Re-sort when an item is renamed via the inline editor.
         self.itemChanged.connect(self._on_item_changed)
-        # Give rows enough height that the inline rename editor is not clipped.
-        self.setUniformRowHeights(True)
+        # Rows use per-item size hints (the rename editor needs height, and the
+        # top/bottom spacer rows are taller), so do NOT force uniform heights.
+        self.setUniformRowHeights(False)
         self._row_height = 24
         # Custom drag auto-scroll: the built-in only scrolls inside the widget at
         # a fixed rate. We disable it and drive our own timer so scrolling
@@ -63,21 +65,40 @@ class DiscTreeWidget(QTreeWidget):
         self._scroll_timer.timeout.connect(self._drag_scroll_tick)
         self._scroll_speed = 0.0            # rows/sec-ish, sign = direction
         self._hl_item = None                # folder currently highlighted as drop target
-        # Blank space before the first item and after the last item, inside the
-        # tree content. Drops in this blank space hit empty space -> disc root,
-        # so root drops always have somewhere to land. Implemented as content
-        # padding on the tree, so it scrolls with the items and is not a fixed
-        # permanent band.
-        self._pad = 12
         self.setStyleSheet(
             "QTreeWidget {"
             "  background-color: #3b4261;"
             "  border: 1px solid #414868;"
             "  border-radius: 4px;"
             "  selection-background-color: #7aa2f7;"
-            "  padding-top: %dpx; padding-bottom: %dpx;"
-            "}" % (self._pad, self._pad)
+            "}"
         )
+        # Real, hittable blank drop space inside the tree content: a tall spacer
+        # row pinned as the first and last rows. They render empty, accept drops
+        # (a drop on a spacer -> disc root), are not draggable/renamable, and are
+        # never burned. This is the in-tree blank area for easy root drops.
+        self._spacer_h = 20
+        self._make_spacers()
+
+    def _make_spacer(self) -> QTreeWidgetItem:
+        from PyQt6.QtCore import QSize
+        it = QTreeWidgetItem([""])
+        it.setData(0, _ROLE_SPACER, True)
+        # Selectable/enabled so Qt routes drops to it, but NOT draggable and NOT
+        # editable, and it holds no content.
+        it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled)
+        it.setSizeHint(0, QSize(0, self._spacer_h))
+        return it
+
+    def _make_spacers(self):
+        self._top_spacer = self._make_spacer()
+        self._bottom_spacer = self._make_spacer()
+        self.addTopLevelItem(self._top_spacer)
+        self.addTopLevelItem(self._bottom_spacer)
+
+    @staticmethod
+    def _is_spacer(item: QTreeWidgetItem) -> bool:
+        return item is not None and bool(item.data(0, _ROLE_SPACER))
 
     # -- item helpers ---------------------------------------------------------
     @staticmethod
@@ -146,13 +167,18 @@ class DiscTreeWidget(QTreeWidget):
     def _sort_container(self, parent: QTreeWidgetItem | None):
         """Re-sort the direct children of parent (or the top level) in place:
         folders first, then files, alphabetical within each group. Recurses into
-        subfolders. Preserves expansion state and the current selection."""
+        subfolders. Preserves expansion state and the current selection. The
+        top-level spacer rows are always kept first and last."""
         if parent is None:
             items = [self.takeTopLevelItem(0) for _ in range(self.topLevelItemCount())]
-            items.sort(key=self._sort_key)
-            for it in items:
+            reals = [it for it in items if not self._is_spacer(it)]
+            reals.sort(key=self._sort_key)
+            # Pin the top spacer first, then real items, then the bottom spacer.
+            self.addTopLevelItem(self._top_spacer)
+            for it in reals:
                 self.addTopLevelItem(it)
-            for it in items:
+            self.addTopLevelItem(self._bottom_spacer)
+            for it in reals:
                 if self._is_dir(it):
                     self._sort_container(it)
         else:
@@ -218,6 +244,8 @@ class DiscTreeWidget(QTreeWidget):
 
     def remove_selected(self):
         for it in list(self.selectedItems()):
+            if self._is_spacer(it):
+                continue  # spacers are permanent
             parent = it.parent()
             if parent is None:
                 idx = self.indexOfTopLevelItem(it)
@@ -228,23 +256,33 @@ class DiscTreeWidget(QTreeWidget):
         self.changed.emit()
 
     def clear_all(self):
-        self.clear()
+        # Remove only the real items; keep the spacer rows.
+        for it in [self.topLevelItem(i) for i in range(self.topLevelItemCount())]:
+            if not self._is_spacer(it):
+                self.takeTopLevelItem(self.indexOfTopLevelItem(it))
         self.changed.emit()
 
     def export_tree(self) -> list:
-        """Serialize to the ISOBuilder.build_tree() description."""
+        """Serialize to the ISOBuilder.build_tree() description (excludes spacers)."""
         def node(item: QTreeWidgetItem):
             if self._is_dir(item):
                 return {"name": item.text(0),
                         "children": [node(item.child(i)) for i in range(item.childCount())]}
             return {"name": item.text(0), "src": item.data(0, _ROLE_SRC)}
-        return [node(self.topLevelItem(i)) for i in range(self.topLevelItemCount())]
+        out = []
+        for i in range(self.topLevelItemCount()):
+            it = self.topLevelItem(i)
+            if not self._is_spacer(it):
+                out.append(node(it))
+        return out
 
     def total_size(self) -> int:
         """Sum of source file sizes currently in the tree (bytes)."""
         total = 0
         def walk(item: QTreeWidgetItem):
             nonlocal total
+            if self._is_spacer(item):
+                return
             if self._is_dir(item):
                 for i in range(item.childCount()):
                     walk(item.child(i))
@@ -260,7 +298,10 @@ class DiscTreeWidget(QTreeWidget):
         return total
 
     def is_empty(self) -> bool:
-        return self.topLevelItemCount() == 0
+        for i in range(self.topLevelItemCount()):
+            if not self._is_spacer(self.topLevelItem(i)):
+                return False
+        return True
 
     # -- context menu / clipboard --------------------------------------------
     def _context_menu(self, point):
@@ -484,11 +525,10 @@ class DiscTreeWidget(QTreeWidget):
 
     def _drop_dest_folder(self, pos):
         """The folder an item would drop INTO for a hover at pos, or None for the
-        root. Over a folder row -> that folder; over a file -> its parent folder;
-        empty space (including the blank padding before the first / after the
-        last item) -> root."""
+        root. A drop on a top/bottom spacer row -> root. Over a folder -> that
+        folder; over a file -> its parent folder; empty space -> root."""
         item = self.itemAt(pos)
-        if item is None:
+        if item is None or self._is_spacer(item):
             return None
         if self._is_dir(item):
             return item
