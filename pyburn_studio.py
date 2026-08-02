@@ -196,7 +196,8 @@ def cli_burn_data(args):
         # Stage 2: burn via SPTI/MMC (no COM), real per-sector progress.
         writer = SPTIWriter()
         writer.burn_iso(iso_tmp, args.device, on_status, on_progress, on_log,
-                        speed_kbps=speed_kbps, dummy=args.dummy, eject_after=args.eject)
+                        speed_kbps=speed_kbps, dummy=args.dummy, eject_after=args.eject,
+                        verify=getattr(args, "verify", False))
 
         emit("PROGRESS 100")
         emit("RESULT OK")
@@ -269,6 +270,7 @@ if __name__ == "__main__":
     p_bd.add_argument("--speed", default="Auto", help="Burn speed (Auto or x-multiplier)")
     p_bd.add_argument("--auto-blank", action="store_true", help="Erase rewritable media if not blank")
     p_bd.add_argument("--eject", action="store_true", help="Eject after burn")
+    p_bd.add_argument("--verify", action="store_true", help="Read back and compare the disc after burning")
     p_bd.add_argument("--dummy", action="store_true", help="Simulate write (no disc written)")
     p_ba = sub.add_parser("cli-burn-audio", help=argparse.SUPPRESS)
     p_ba.add_argument("--file", action="append", required=True, help="WAV track (repeatable, in order)")
