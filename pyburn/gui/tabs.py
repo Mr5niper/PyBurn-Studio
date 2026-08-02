@@ -12,7 +12,7 @@ from PyQt6.QtGui import QFont
 from ..core.config import Config
 from ..core.jobs import Job, JobOptions, JobType
 from ..core.tools import ToolFinder
-from .widgets import FileListWidget, CapacityGauge, compute_total_size, compute_total_duration, dvd_max_minutes, bd_max_minutes
+from .widgets import FileListWidget, DiscTreeWidget, CapacityGauge, compute_total_size, compute_total_duration, dvd_max_minutes, bd_max_minutes
 from ..services.queue import JobQueueService
 from ..services.metadata import musicbrainz_lookup
 from ..services.media import MediaTools
@@ -220,19 +220,24 @@ class DataBurnTab(BaseTab):
         title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         lay.addWidget(title)
         lay.addWidget(self._make_drive_row())
-        self.list = FileListWidget(allow_dirs=True)
-        lay.addWidget(QLabel("Files/Folders (drag & drop):"))
-        lay.addWidget(self.list)
+        lay.addWidget(QLabel("Disc contents (this is the root of the disc; drag files and "
+                             "folders here, and drag items into folders to arrange them):"))
+        self.tree = DiscTreeWidget()
+        lay.addWidget(self.tree)
         row = QHBoxLayout()
         b_add = QPushButton("Add Files")
         b_add.clicked.connect(self._add_files)
         b_dir = QPushButton("Add Folder")
         b_dir.clicked.connect(self._add_dir)
+        b_newf = QPushButton("New Folder")
+        b_newf.clicked.connect(self._new_folder)
+        b_ren = QPushButton("Rename")
+        b_ren.clicked.connect(self._rename)
         b_rm = QPushButton("Remove Selected")
         b_rm.clicked.connect(self._rm)
         b_cl = QPushButton("Clear")
-        b_cl.clicked.connect(self.list.clear)
-        for b in (b_add, b_dir, b_rm, b_cl):
+        b_cl.clicked.connect(self._clear)
+        for b in (b_add, b_dir, b_newf, b_ren, b_rm, b_cl):
             row.addWidget(b)
         lay.addLayout(row)
         opts = QGroupBox("Options")
@@ -251,21 +256,24 @@ class DataBurnTab(BaseTab):
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
         lay.addWidget(self.status)
-        self.list.files_changed.connect(self._refresh)
-        self.cbo_type.currentIndexChanged.connect(lambda: self._refresh(self.list.get_file_list()))
-        self._refresh(self.list.get_file_list())
+        self.tree.changed.connect(self._refresh)
+        self.cbo_type.currentIndexChanged.connect(self._refresh)
+        self._refresh()
 
     def _capacity(self) -> int:
         return [CD_BYTES, DVD_BYTES, BD25_BYTES][self.cbo_type.currentIndex()]
 
-    def _refresh(self, files: List[str]):
+    def _refresh(self, *args):
         self.gauge.max_capacity = self._capacity()
-        self.gauge.update_size(compute_total_size(files))
+        self.gauge.update_size(self.tree.total_size())
 
     def _add_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Select Files")
-        for f in files:
-            self.list.add_path(f)
+        if files:
+            # Add into the selected folder if one is selected, else the root.
+            sel = self.tree.selectedItems()
+            parent = sel[0] if (sel and self.tree._is_dir(sel[0])) else None
+            self.tree.add_files(files, parent)
 
     def _pick_folder(self) -> str:
         """Open a folder chooser and return the selected path (or "").
@@ -318,22 +326,33 @@ class DataBurnTab(BaseTab):
         box.setDefaultButton(btn_folder)
         box.exec()
         clicked = box.clickedButton()
+        # Add into the selected folder if one is selected, else the disc root.
+        sel = self.tree.selectedItems()
+        parent = sel[0] if (sel and self.tree._is_dir(sel[0])) else None
         if clicked is btn_folder:
-            # The ISO builder nests a folder path as a top-level folder.
-            self.list.add_path(str(folder))
+            self.tree.add_folder_as_folder(str(folder), parent)
         elif clicked is btn_contents:
-            # Add each immediate child so the builder places them at the root.
-            try:
-                for child in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
-                    self.list.add_path(str(child))
-            except Exception as e:
-                QMessageBox.warning(self, "Add Folder",
-                                    f"Could not read the folder's contents:\n{e}")
+            self.tree.add_folder_contents(str(folder), parent)
+
+    def _new_folder(self):
+        sel = self.tree.selectedItems()
+        parent = sel[0] if (sel and self.tree._is_dir(sel[0])) else None
+        item = self.tree.new_folder(parent)
+        self.tree.setCurrentItem(item)
+        self.tree.editItem(item, 0)  # let the user type the name immediately
+
+    def _rename(self):
+        sel = self.tree.selectedItems()
+        if not sel:
+            QMessageBox.information(self, "Rename", "Select an item to rename.")
+            return
+        self.tree.editItem(sel[0], 0)
 
     def _rm(self):
-        for it in self.list.selectedItems():
-            self.list.takeItem(self.list.row(it))
-        self._refresh(self.list.get_file_list())
+        self.tree.remove_selected()
+
+    def _clear(self):
+        self.tree.clear_all()
 
     def _warn_oversized_media(self, data_bytes: int, cap_bytes: int) -> bool:
         if data_bytes > 0 and cap_bytes >= 10 * data_bytes:
@@ -345,9 +364,8 @@ class DataBurnTab(BaseTab):
         return True
 
     def _start(self):
-        files = self.list.get_file_list()
-        if not files:
-            QMessageBox.warning(self, "No Files", "Add files or folders.")
+        if self.tree.is_empty():
+            QMessageBox.warning(self, "No Files", "Add files or folders to the disc.")
             return
         if self.gauge.current_size > self.gauge.max_capacity:
             r = QMessageBox.question(self, "Over Capacity", "Content exceeds disc capacity. Continue?",
@@ -371,9 +389,10 @@ class DataBurnTab(BaseTab):
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if r != QMessageBox.StandardButton.Yes:
                 return
+        disc_tree = self.tree.export_tree()
         job = Job(
             job_type=JobType.DATA,
-            files=[Path(p) for p in files],
+            files=[],
             device=device,
             options=JobOptions(
                 temp_dir=temp_dir,
@@ -383,6 +402,7 @@ class DataBurnTab(BaseTab):
                 auto_blank=self.cfg.drive_setting(device, "auto_blank_rw", True),
                 eject_after=self.cfg.drive_setting(device, "eject_after_burn", True),
                 dummy=False,
+                disc_tree=disc_tree,
             ),
         )
         self._register_job(job)
