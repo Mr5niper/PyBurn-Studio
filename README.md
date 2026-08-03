@@ -8,14 +8,17 @@ dvdauthor, cdparanoia, and friends). On Windows it burns and reads discs with
 its own built-in engine that talks to the drive directly (SPTI/MMC for writing,
 IOCTL for reading), with no external tools, and uses a WSL2 Linux environment
 only for the DVD and Blu-ray authoring steps that have no Windows equivalent. It
-shows real progress, a job queue, verification, and history.
+shows real progress, a job queue, after-burn verification, and history.
 
 ## What it does
 
-- Burn data discs (CD, DVD, Blu-ray) from files and folders. On Linux an ISO is
-  built by mkisofs and written by growisofs or cdrecord; on Windows the built-in
-  engine builds an ISO9660/Joliet image in pure Python and writes it to the
-  drive directly with SPTI/MMC commands, with no external tools.
+- Burn data discs (CD, DVD, Blu-ray) from files and folders. The Data tab is a
+  disc-contents composer: drag files and folders in, create folders, rename
+  entries, and drag items between folders to lay out exactly how the disc root
+  should look. On Linux an ISO is built by mkisofs and written by growisofs or
+  cdrecord; on Windows the built-in engine builds an ISO9660/Joliet image in pure
+  Python from that layout and writes it to the drive directly with SPTI/MMC
+  commands, with no external tools.
 - Author audio CDs from MP3/WAV/FLAC/OGG/M4A/AAC. On Linux via cdrdao with
   optional CD-Text; on Windows via the built-in SPTI/MMC engine (gapless
   Disc-At-Once Red Book audio) with ffmpeg decoding the tracks.
@@ -27,8 +30,13 @@ shows real progress, a job queue, verification, and history.
 - Queue multiple jobs and run them one at a time so the drive is never double
   booked, with a live progress bar, a global job log, and a persistent history
   you can retry from.
-- Verify burns two ways: read the disc back and compare size plus a SHA-256
-  checksum for small images, or fall back to an isoinfo listing compare.
+- Verify a data burn by reading the disc back and comparing it to the image that
+  was written. On Windows the built-in engine reads the burned disc through
+  SPTI/MMC and compares it to the authored ISO sector by sector, reporting the
+  first sector that differs if anything is wrong. On Linux the check uses the
+  command-line tools (an isoinfo listing compare, or a size-plus-checksum compare
+  for small images). Verification is turned on per drive in Settings and runs
+  after the burn, before the disc is ejected.
 
 If a required tool is missing, the app can run the job in simulation mode so you
 can still exercise the interface. This is controlled in Settings.
@@ -110,7 +118,9 @@ Blu-ray) and confirms the queue runs them all to completion in order.
 
 The repository ships a reproducible build. Requirements are fully pinned in
 `requirements.txt`, the build creates its own virtual environment, and the
-PyInstaller recipe is the checked-in `pyburn_studio.spec`.
+PyInstaller command is run inline by `BUILD_EXE.bat` (no spec file is used or
+checked in; any `pyburn_studio.spec` that PyInstaller generates is a throwaway
+byproduct).
 
 On Windows, double-click `BUILD_EXE.bat`. It verifies Python 3.13.12 through the
 `py -3.13` launcher, creates `.\venv`, installs the pinned requirements, and
@@ -121,8 +131,9 @@ manual PowerShell steps, are in `Docs/BUILD_EXE.md`.
 
 1. Open the tab for the kind of disc you want (Data, Audio, Video DVD, Blu-ray,
    or Rip CD).
-2. Add files or folders. For data and media discs the capacity gauge shows how
-   full the disc will be.
+2. Add files or folders. On the Data tab you can also create folders, rename
+   entries, and drag items in and out of folders to arrange the disc layout; the
+   capacity gauge shows how full the disc will be.
 3. Set options (volume label, verify, auto-blank rewritable media, eject after
    burn, and so on). Global defaults live in Settings.
 4. Click the Queue Job button. The job goes into the queue at the bottom and
@@ -133,7 +144,9 @@ manual PowerShell steps, are in `Docs/BUILD_EXE.md`.
 
 ## Configuration and data locations
 
-- Settings: `~/.pyburn_config.json`
+- Settings: `pyburn_studio.config` (next to the executable in a packaged build,
+  otherwise in your home directory), storing per-drive settings plus global
+  defaults
 - History: `~/.pyburn_history.json`
 - Per-job logs: `~/.pyburn_logs/`
 - Temporary build files: the temp directory set in Settings

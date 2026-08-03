@@ -72,10 +72,14 @@ Services (`pyburn/services/`), where the work happens:
   DeviceIoControl and sends raw MMC commands over IOCTL_SCSI_PASS_THROUGH_DIRECT
   to burn data CDs (Track-At-Once) and audio CDs (gapless Session-At-Once with a
   cue sheet), issuing every WRITE(10) itself so progress is exact and no COM is
-  in the write path. It performs OPC (laser power calibration) before writing.
+  in the write path. It performs OPC (laser power calibration) before writing, and
+  when verification is enabled it reads the finished data disc back with READ(10)
+  and compares it to the authored ISO sector by sector before ejecting.
 - `iso_builder.py` authors an ISO9660 + Joliet data image in pure Python (shared
   file extents for both directory trees), replacing IMAPI2 image authoring for
-  the data burn. No COM, no external tools.
+  the data burn. No COM, no external tools. `build()` takes a flat file list;
+  `build_tree()` takes the explicit folder layout composed on the Data tab, both
+  through one shared authoring pipeline.
 - `ioctl_ripper.py` is the native Windows CD ripper via DeviceIoControl, with
   ffmpeg encoding when present.
 - `wsl_backend.py` authors DVD (dvdauthor) and Blu-ray (tsMuxeR) images inside
@@ -90,8 +94,9 @@ Services (`pyburn/services/`), where the work happens:
 - `progress.py` (ProgressTools) parses tool output into a percent.
 - `media.py` (MediaTools) reads media info and resolves burn speed, blank, and
   eject.
-- `verify.py` (VerificationTools) does readback plus checksum, or isoinfo
-  listing compare.
+- `verify.py` (VerificationTools) is the Linux/CLI verification path (readback
+  plus checksum, or isoinfo listing compare). On the native Windows data path,
+  read-back verification is done by the SPTI writer itself, not this module.
 - `metadata.py` does the optional MusicBrainz lookup.
 
 Per-platform engine routing (the heart of the cross-platform design):
@@ -197,6 +202,15 @@ user asked to verify but neither readom nor isoinfo is present, the burn still
 runs for real and a warning is logged that verification will be skipped. This
 avoids the surprise of a fully simulated burn just because the user ticked
 verify on a box that only has isoinfo.
+
+The above describes the Linux/CLI path. On the native Windows data path there are
+no external verify tools: when the drive's verify setting is on, spti_writer reads
+the finished disc back with READ(10) after the write and session close, and
+compares it to the authored ISO sector by sector before the disc is ejected,
+failing with the first differing sector on a mismatch. The flag reaches the burn
+through burn.py, which adds --verify to the cli-burn-data subprocess, and the CLI
+passes it to SPTIWriter.burn_iso. The write path is unchanged; verification is a
+read-only step layered after it.
 
 ## 7) Speed resolution (media.py)
 
