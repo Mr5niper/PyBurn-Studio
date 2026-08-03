@@ -596,15 +596,83 @@ class SPTIWriter:
             on_log(f"spti-audio: WRITE(10) failed at LBA {lba} ({self._sense_str(sense)})")
         return ok
 
+    def _read10(self, handle, lba: int, sectors: int, on_log: OnLog) -> Optional[bytes]:
+        # 28h READ(10): LBA in bytes 2-5 (big-endian), transfer length in sectors
+        # in bytes 7-8. Returns sectors * 2048 bytes, or None on failure. This is
+        # a READ; it never writes to the disc.
+        cdb = bytes([0x28, 0x00,
+                     (lba >> 24) & 0xFF, (lba >> 16) & 0xFF, (lba >> 8) & 0xFF, lba & 0xFF,
+                     0x00,
+                     (sectors >> 8) & 0xFF, sectors & 0xFF,
+                     0x00])
+        ok, sense, data, status = self._scsi(handle, cdb, SCSI_IOCTL_DATA_IN,
+                                             data_len=sectors * CD_SECTOR_DATA, timeout=120)
+        if not ok:
+            on_log(f"spti-verify: READ(10) failed at LBA {lba} ({self._sense_str(sense)})")
+            return None
+        return data
+
+    def _verify_against_iso(self, handle, iso_path: Path, total_sectors: int,
+                            on_status: OnStatus, on_progress: OnProgress, on_log: OnLog) -> None:
+        """Read the disc back and compare it, sector for sector, to the ISO we
+        just wrote. Raises RuntimeError on any mismatch or read failure. This is
+        a pure read of the disc; it does not alter the write path or the media."""
+        on_status("Verifying disc against image (SPTI/MMC)...")
+        on_log(f"spti-verify: comparing {total_sectors} sectors")
+        read_chunk = SECTORS_PER_WRITE
+        checked = 0
+        last_prog = time.monotonic()
+        last_pct = -1
+        with open(iso_path, "rb") as f:
+            lba = 0
+            while lba < total_sectors:
+                if self._cancelled:
+                    raise RuntimeError("Verify cancelled")
+                n = min(read_chunk, total_sectors - lba)
+                want = f.read(CD_SECTOR_DATA * n)
+                # Pad the expected tail to whole sectors exactly like the burn did.
+                rem = len(want) % CD_SECTOR_DATA
+                if rem:
+                    want = want + (b"\x00" * (CD_SECTOR_DATA - rem))
+                need = CD_SECTOR_DATA * n
+                if len(want) < need:
+                    want = want + (b"\x00" * (need - len(want)))
+                got = self._read10(handle, lba, n, on_log)
+                if got is None:
+                    raise RuntimeError(f"Verify failed: could not read the disc at sector {lba}.")
+                if got[:need] != want[:need]:
+                    # Find the first differing sector for a precise message.
+                    for s in range(n):
+                        a = got[s * CD_SECTOR_DATA:(s + 1) * CD_SECTOR_DATA]
+                        b = want[s * CD_SECTOR_DATA:(s + 1) * CD_SECTOR_DATA]
+                        if a != b:
+                            raise RuntimeError(
+                                f"Verify failed: disc differs from the image at sector {lba + s}.")
+                    raise RuntimeError(f"Verify failed near sector {lba}.")
+                lba += n
+                checked += n
+                now = time.monotonic()
+                if now - last_prog >= 0.3:
+                    pct = int((checked * 100) / max(1, total_sectors))
+                    if pct != last_pct:
+                        on_progress(max(0, min(100, pct)))
+                        last_pct = pct
+                    last_prog = now
+        on_progress(100)
+        on_status("Verify passed: disc matches the image.")
+        on_log("spti-verify: OK, disc matches image byte-for-byte")
+
     # -- public: burn a finished ISO to a blank CD-R --------------------------
     def burn_iso(self, iso_path: Path, device: str,
                  on_status: OnStatus, on_progress: OnProgress, on_log: OnLog,
                  speed_kbps: int = 0, dummy: bool = False,
-                 eject_after: bool = True) -> None:
+                 eject_after: bool = True, verify: bool = False) -> None:
         """Burn a finished ISO image to a blank CD-R via SPTI/MMC (TAO).
 
         speed_kbps: write speed in kbytes/sec (1000 bytes), or 0 for fastest.
         dummy: True runs a test/simulation write (laser off) if the drive allows.
+        verify: True reads the disc back after writing and compares it to the ISO
+                byte-for-byte before ejecting. Read-only; does not affect the write.
         """
         iso_path = Path(iso_path)
         size = iso_path.stat().st_size
@@ -688,6 +756,12 @@ class SPTIWriter:
 
             on_progress(100)
             on_status("Data disc burned successfully (SPTI/MMC).")
+
+            # Optional read-back verification, before ejecting. A test (dummy)
+            # write put nothing on the disc, so there is nothing to verify.
+            if verify and not dummy:
+                self._verify_against_iso(handle, iso_path, total_sectors,
+                                         on_status, on_progress, on_log)
         finally:
             self._unlock_volume(handle)
             if eject_after:

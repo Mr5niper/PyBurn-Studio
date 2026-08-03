@@ -165,13 +165,23 @@ def cli_burn_data(args):
         from pyburn.services.iso_builder import ISOBuilder
         from pyburn.services.spti_writer import SPTIWriter
 
-        files = [_Path(p) for p in args.file]
+        tree = getattr(args, "tree", None)
         temp_dir = _Path(args.temp_dir) if args.temp_dir else _Path(_tempfile.gettempdir())
         temp_dir.mkdir(parents=True, exist_ok=True)
-        iso_tmp = temp_dir / ("pyburn_%d.iso" % (abs(hash(tuple(str(f) for f in files))) % 10_000_000))
 
-        # Stage 1: author the ISO in PURE PYTHON (no COM at all).
-        ISOBuilder().build(files, iso_tmp, args.volume, on_status, on_log)
+        if tree:
+            # Explicit disc layout (rename/new-folder/move) authored via
+            # build_tree(). Read the JSON description written by the parent.
+            import json as _json
+            with open(tree, "r", encoding="utf-8") as tf:
+                disc_tree = _json.load(tf)
+            iso_tmp = temp_dir / ("pyburn_%d.iso" % (abs(hash(_json.dumps(disc_tree))) % 10_000_000))
+            ISOBuilder().build_tree(disc_tree, iso_tmp, args.volume, on_status, on_log)
+        else:
+            files = [_Path(p) for p in args.file]
+            iso_tmp = temp_dir / ("pyburn_%d.iso" % (abs(hash(tuple(str(f) for f in files))) % 10_000_000))
+            # Stage 1: author the ISO in PURE PYTHON (no COM at all).
+            ISOBuilder().build(files, iso_tmp, args.volume, on_status, on_log)
 
         # Convert the CD x-multiplier speed to kbytes/sec for SET CD SPEED.
         # 1x CD = 176.4 kB/s (1000-byte kB per MMC). 0 = fastest.
@@ -186,7 +196,8 @@ def cli_burn_data(args):
         # Stage 2: burn via SPTI/MMC (no COM), real per-sector progress.
         writer = SPTIWriter()
         writer.burn_iso(iso_tmp, args.device, on_status, on_progress, on_log,
-                        speed_kbps=speed_kbps, dummy=args.dummy, eject_after=args.eject)
+                        speed_kbps=speed_kbps, dummy=args.dummy, eject_after=args.eject,
+                        verify=getattr(args, "verify", False))
 
         emit("PROGRESS 100")
         emit("RESULT OK")
@@ -251,13 +262,15 @@ if __name__ == "__main__":
     parser.add_argument("--self-test", action="store_true", help="Run built-in non-destructive self-tests")
     sub = parser.add_subparsers(dest="cli_command")
     p_bd = sub.add_parser("cli-burn-data", help=argparse.SUPPRESS)
-    p_bd.add_argument("--file", action="append", required=True, help="File or folder to add (repeatable)")
+    p_bd.add_argument("--file", action="append", default=[], help="File or folder to add (repeatable)")
+    p_bd.add_argument("--tree", default="", help="Path to a JSON disc-layout description (overrides --file)")
     p_bd.add_argument("--device", required=True, help="Target drive, e.g. H:")
     p_bd.add_argument("--volume", default="DATA_DISC", help="Volume label")
     p_bd.add_argument("--temp-dir", default="", help="Temp directory")
     p_bd.add_argument("--speed", default="Auto", help="Burn speed (Auto or x-multiplier)")
     p_bd.add_argument("--auto-blank", action="store_true", help="Erase rewritable media if not blank")
     p_bd.add_argument("--eject", action="store_true", help="Eject after burn")
+    p_bd.add_argument("--verify", action="store_true", help="Read back and compare the disc after burning")
     p_bd.add_argument("--dummy", action="store_true", help="Simulate write (no disc written)")
     p_ba = sub.add_parser("cli-burn-audio", help=argparse.SUPPRESS)
     p_ba.add_argument("--file", action="append", required=True, help="WAV track (repeatable, in order)")

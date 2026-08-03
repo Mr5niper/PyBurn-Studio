@@ -1,6 +1,80 @@
 # PyBurn Studio - Changelog
 
-## [1.15.0] - 2026 - Native SPTI/MMC burn engine on Windows
+## [1.31.0.0] - 2026 - Disc-contents composer, per-drive settings, and after-burn verification
+
+### Added
+- Disc-contents composer on the Data tab (pyburn/gui/widgets.py DiscTreeWidget).
+  The flat file list is replaced by a folder tree that represents the disc root:
+  drag files and folders in from the file manager, create folders, rename entries
+  to change their on-disc names, and drag items between folders to arrange the
+  layout. Folders sort first then files, case-insensitive alphabetical, re-sorted
+  after every change; there is real blank drop space at the top and bottom of the
+  tree (pinned spacer rows) so dropping at the disc root is always easy; a folder
+  under the cursor highlights to show "drop into this folder" and everything else
+  targets the root. A right-click menu offers New Folder, Rename, Remove, Copy,
+  Paste, and Open in Explorer, and dragging near the top or bottom edge auto-scrolls
+  and accelerates as the cursor passes the edge. The composed layout is authored by
+  a new ISOBuilder.build_tree() that shares the same pipeline as the flat build();
+  it is carried on JobOptions.disc_tree, staged to a temp JSON, and passed to
+  cli-burn-data as --tree. When no tree is present the original flat build() path is
+  unchanged. Verified against a standard ISO parser across rename, new-folder, move,
+  empty-folder, and deep-nesting cases, byte-exact.
+- Per-tab drive selection. Every tab (Data, Audio, Video DVD, Blu-ray, Rip) has a
+  "Drive:" dropdown with a Refresh button, so a job can target any drive instead of
+  only the global default. The optical-drive scan is cached process-wide
+  (core/devices.py get_devices/refresh_devices) so the dropdowns share one scan
+  instead of each triggering the slow enumeration; Refresh forces a rescan.
+- After-burn verification on the native Windows data path. When a drive's "verify
+  after burn" setting is on, the SPTI engine reads the finished disc back with
+  READ(10) and compares it to the authored ISO sector by sector before ejecting,
+  showing a "Verifying disc against image" status with progress and reporting the
+  first differing sector on a mismatch. It is read-only and does not touch the
+  write path. Previously the verify flag was saved and shown in the UI but never
+  reached the native Windows burn, so a data burn went straight to eject with no
+  check; it now runs when enabled.
+
+### Changed
+- Settings are now the single source of truth, backed by a per-PC config file
+  pyburn_studio.config (next to the executable, or the project root when run from
+  source; gitignored, auto-created). It stores per-drive settings (burn speed,
+  verify after burn, auto-blank rewritable, eject after burn) plus a global section
+  (temp dir, audio/video defaults, simulate-when-missing-tools, MusicBrainz,
+  default drive, history and log locations), and migrates the old flat
+  ~/.pyburn_config.json. The Settings window is now a per-drive editor with a drive
+  dropdown that live-saves that drive's options and a Set-as-default control. The
+  duplicated per-drive options were removed from the individual tabs, which now read
+  them from the selected drive's config; the Test-burn (simulate) option was removed
+  (jobs always run for real). Rip Format and Bitrate remain on the Rip tab as
+  per-operation controls.
+- Add Folder on the Data tab uses the classic Windows Shell "Browse For Folder"
+  dialog (SHBrowseForFolder via ctypes), falling back to Qt's tree-only directory
+  chooser off Windows, and then asks whether to add the folder itself (a top-level
+  disc folder) or its contents (children placed at the disc root).
+
+### Fixed
+- Jobs no longer show a modal "Started" popup. Each of the five tabs fired a modal
+  dialog the instant a job started, duplicating the status line and Queue tab;
+  replaced with a non-blocking "Started: <job>" status update.
+- Jobs no longer fail silently. Each tab now surfaces its own job's result with a
+  "Job Failed" dialog and status on failure and a status update on success. The
+  ripper detects an empty drive (ERROR_NOT_READY / ERROR_NO_MEDIA_IN_DRIVE) and
+  raises a plain "No disc in the drive" message instead of a raw IOCTL error.
+- The README and BUILD_GUIDE still described a spec-based PyInstaller build (a
+  checked-in pyburn_studio.spec); corrected to the actual no-spec build driven by
+  BUILD_EXE.bat's inline command, matching Docs/BUILD_EXE.md, which was rewritten to
+  document the real batch-file steps and exact command (any generated
+  pyburn_studio.spec is a throwaway byproduct).
+- The README described verification as a size/SHA-256 or isoinfo compare only;
+  updated to describe the native Windows SPTI read-back compare and the Linux
+  CLI-tool path, corrected the settings path to pyburn_studio.config, and documented
+  the disc composer in the feature list and usage steps.
+
+### Notes
+- No changes to the SPTI write path, OPC, or the ripper for the composer or the
+  settings/UX work; the burn and rip engines are unchanged apart from the read-only
+  verify step and the threading of the verify flag through burn.py and the CLI.
+
+## [1.15.0.0] - 2026 - Native SPTI/MMC burn engine on Windows
 
 Windows disc burning was rewritten to talk to the drive directly instead of
 going through the IMAPI2 COM API. IMAPI2's progress-event model corrupted burns

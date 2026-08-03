@@ -30,6 +30,10 @@ class JobOptions:
     album_performer: Optional[str] = None
     track_titles: Optional[List[str]] = None
     track_performers: Optional[List[str]] = None
+    # Optional explicit disc layout (list of {"name","src"}|{"name","children"})
+    # for data burns composed in the disc-tree view. When present the data burn
+    # authors the ISO from this tree instead of from the flat file list.
+    disc_tree: Optional[List[Any]] = None
 
 
 @dataclass

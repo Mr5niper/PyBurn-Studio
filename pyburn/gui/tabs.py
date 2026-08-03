@@ -12,7 +12,7 @@ from PyQt6.QtGui import QFont
 from ..core.config import Config
 from ..core.jobs import Job, JobOptions, JobType
 from ..core.tools import ToolFinder
-from .widgets import FileListWidget, CapacityGauge, compute_total_size, compute_total_duration, dvd_max_minutes, bd_max_minutes
+from .widgets import FileListWidget, DiscTreeWidget, CapacityGauge, compute_total_size, compute_total_duration, dvd_max_minutes, bd_max_minutes
 from ..services.queue import JobQueueService
 from ..services.metadata import musicbrainz_lookup
 from ..services.media import MediaTools
@@ -34,6 +34,72 @@ def disk_free_bytes(path: Path) -> int:
         return 0
 
 
+def _shbrowseforfolder(parent, title: str) -> str:
+    """Show the classic Windows Shell 'Browse For Folder' dialog (the compact
+    folder tree with OK/Cancel) and return the chosen path, or "" if cancelled.
+
+    Uses the old dialog style (BIF_RETURNONLYFSDIRS, no BIF_NEWDIALOGSTYLE), which
+    is the tree-only look. Windows-only; callers fall back to a Qt chooser
+    elsewhere. Pure GUI helper.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    shell32 = ctypes.windll.shell32
+    ole32 = ctypes.windll.ole32
+
+    class BROWSEINFO(ctypes.Structure):
+        _fields_ = [
+            ("hwndOwner", wintypes.HWND),
+            ("pidlRoot", ctypes.c_void_p),
+            ("pszDisplayName", wintypes.LPWSTR),
+            ("lpszTitle", wintypes.LPCWSTR),
+            ("ulFlags", wintypes.UINT),
+            ("lpfn", ctypes.c_void_p),
+            ("lParam", wintypes.LPARAM),
+            ("iImage", ctypes.c_int),
+        ]
+
+    BIF_RETURNONLYFSDIRS = 0x00000001
+
+    shell32.SHBrowseForFolderW.argtypes = [ctypes.POINTER(BROWSEINFO)]
+    shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+    shell32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR]
+    shell32.SHGetPathFromIDListW.restype = wintypes.BOOL
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    ole32.CoTaskMemFree.restype = None
+
+    # Owner window handle, so the dialog is modal to the app when possible.
+    hwnd = 0
+    try:
+        if parent is not None:
+            hwnd = int(parent.winId())
+    except Exception:
+        hwnd = 0
+
+    display_buf = ctypes.create_unicode_buffer(260)
+    bi = BROWSEINFO()
+    bi.hwndOwner = hwnd
+    bi.pidlRoot = None
+    bi.pszDisplayName = ctypes.cast(display_buf, wintypes.LPWSTR)
+    bi.lpszTitle = title
+    bi.ulFlags = BIF_RETURNONLYFSDIRS
+    bi.lpfn = None
+    bi.lParam = 0
+    bi.iImage = 0
+
+    pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
+    if not pidl:
+        return ""
+    try:
+        path_buf = ctypes.create_unicode_buffer(260)
+        if shell32.SHGetPathFromIDListW(pidl, path_buf):
+            return path_buf.value or ""
+        return ""
+    finally:
+        ole32.CoTaskMemFree(pidl)
+
+
 class BaseTab(QWidget):
     def __init__(self, cfg: Config, tools: ToolFinder, queue: JobQueueService):
         super().__init__()
@@ -48,9 +114,95 @@ class BaseTab(QWidget):
         # regardless of which tab started it.
         self._my_job_ids: set[str] = set()
         self.queue.sig_status_update.connect(self._status_update)
+        # Surface job outcomes for this tab's jobs. Without this a failure (for
+        # example ripping with no disc in the drive) only updated the Queue list,
+        # so a user on this tab saw nothing happen and got no error.
+        self.queue.sig_job_finished.connect(self._job_finished)
 
     def _register_job(self, job: Job):
         self._my_job_ids.add(job.id)
+
+    def _make_drive_row(self):
+        """Build a 'Drive:' row with a dropdown of optical drives plus a small
+        Refresh button, for tabs to place in their layout. The selected drive is
+        what the tab's job uses. Defaults to the configured default drive, so if
+        the user does not touch it the device is exactly what it was before.
+
+        Returns a QWidget (the row) ready to add to a layout.
+        """
+        from PyQt6.QtWidgets import QWidget as _QWidget
+        from ..core.devices import get_devices
+        row_w = _QWidget()
+        row = QHBoxLayout(row_w)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QLabel("Drive:"))
+        self.cbo_drive = QComboBox()
+        self._populate_drives(get_devices())
+        row.addWidget(self.cbo_drive, 1)
+        b_refresh = QPushButton("Refresh")
+        b_refresh.setToolTip("Rescan for optical drives")
+        b_refresh.clicked.connect(self._refresh_drives)
+        row.addWidget(b_refresh)
+        return row_w
+
+    def _populate_drives(self, devs):
+        cur = self.cfg.settings.get("default_device", "")
+        self.cbo_drive.clear()
+        sel = -1
+        for i, d in enumerate(devs):
+            self.cbo_drive.addItem(d.display, d.id)
+            if d.id == cur:
+                sel = i
+        if not devs:
+            # Keep a usable fallback so the dropdown is never empty.
+            self.cbo_drive.addItem(str(cur or "default"), cur or "")
+            sel = 0
+        if sel >= 0:
+            self.cbo_drive.setCurrentIndex(sel)
+
+    def _refresh_drives(self):
+        from ..core.devices import refresh_devices
+        self._populate_drives(refresh_devices())
+
+    def selected_device(self) -> str:
+        """The drive chosen in this tab's dropdown, or the configured default if
+        the tab has no dropdown, so callers always get a valid device."""
+        cbo = getattr(self, "cbo_drive", None)
+        if cbo is not None:
+            data = cbo.currentData()
+            if data:
+                return data
+        return self.cfg.settings.get("default_device", "/dev/sr0")
+
+    def _confirm_blank_if_needed(self, device: str) -> bool:
+        # Auto-blank is a per-drive setting now (Settings window), not a per-tab
+        # checkbox. If it is off for this drive, nothing to confirm.
+        if not self.cfg.drive_setting(device, "auto_blank_rw", True):
+            return True
+        try:
+            media = MediaTools(self.tools, ProcessRunner())
+            info = media.get_info(device)
+            if info.get("rewritable") and info.get("blank") is False:
+                r = QMessageBox.question(self, "Blank Media?",
+                                         f"Rewritable media detected in {device}.\n"
+                                         f"This will ERASE all existing data.\n\n"
+                                         f"Continue with blanking?",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                return r == QMessageBox.StandardButton.Yes
+        except Exception:
+            pass
+        return True
+
+    def _job_finished(self, job_id: str, ok: bool, msg: str):
+        if job_id not in self._my_job_ids:
+            return
+        if ok:
+            self.status.setText(msg or "Done.")
+        else:
+            self.status.setText(f"Failed: {msg}" if msg else "Failed.")
+            self.progress.setValue(0)
+            QMessageBox.warning(self, "Job Failed",
+                                msg or "The job did not complete. Check the drive and try again.")
 
     def _status_update(self, job_id: str, status: str, progress: int):
         if job_id not in self._my_job_ids:
@@ -67,40 +219,34 @@ class DataBurnTab(BaseTab):
         title = QLabel("Burn Data Disc")
         title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         lay.addWidget(title)
-        self.list = FileListWidget(allow_dirs=True)
-        lay.addWidget(QLabel("Files/Folders (drag & drop):"))
-        lay.addWidget(self.list)
+        lay.addWidget(self._make_drive_row())
+        lay.addWidget(QLabel("Disc contents (this is the root of the disc; drag files and "
+                             "folders here, and drag items into folders to arrange them):"))
+        self.tree = DiscTreeWidget()
+        lay.addWidget(self.tree)
         row = QHBoxLayout()
         b_add = QPushButton("Add Files")
         b_add.clicked.connect(self._add_files)
         b_dir = QPushButton("Add Folder")
         b_dir.clicked.connect(self._add_dir)
+        b_newf = QPushButton("New Folder")
+        b_newf.clicked.connect(self._new_folder)
+        b_ren = QPushButton("Rename")
+        b_ren.clicked.connect(self._rename)
         b_rm = QPushButton("Remove Selected")
         b_rm.clicked.connect(self._rm)
         b_cl = QPushButton("Clear")
-        b_cl.clicked.connect(self.list.clear)
-        for b in (b_add, b_dir, b_rm, b_cl):
+        b_cl.clicked.connect(self._clear)
+        for b in (b_add, b_dir, b_newf, b_ren, b_rm, b_cl):
             row.addWidget(b)
         lay.addLayout(row)
         opts = QGroupBox("Options")
         form = QFormLayout()
         self.ed_vol = QLineEdit("DATA_DISC")
-        self.chk_verify = QCheckBox("Verify after burn")
-        self.chk_verify.setChecked(bool(self.cfg.settings.get("verify_after_burn", True)))
-        self.chk_blank = QCheckBox("Auto-blank RW media")
-        self.chk_blank.setChecked(bool(self.cfg.settings.get("auto_blank_rw", True)))
-        self.chk_eject = QCheckBox("Eject after burn")
-        self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
-        self.chk_dummy = QCheckBox("Test burn (simulate, no disc written)")
-        self.chk_dummy.setChecked(False)
         self.cbo_type = QComboBox()
         self.cbo_type.addItems(["CD (700MB)", "DVD (4.7GB)", "Blu-ray (25GB)"])
         form.addRow("Volume Label:", self.ed_vol)
         form.addRow("Disc Type:", self.cbo_type)
-        form.addRow("", self.chk_verify)
-        form.addRow("", self.chk_blank)
-        form.addRow("", self.chk_eject)
-        form.addRow("", self.chk_dummy)
         opts.setLayout(form)
         lay.addWidget(opts)
         self.gauge = CapacityGauge(DVD_BYTES)
@@ -110,31 +256,103 @@ class DataBurnTab(BaseTab):
         lay.addWidget(self.btn)
         lay.addWidget(self.progress)
         lay.addWidget(self.status)
-        self.list.files_changed.connect(self._refresh)
-        self.cbo_type.currentIndexChanged.connect(lambda: self._refresh(self.list.get_file_list()))
-        self._refresh(self.list.get_file_list())
+        self.tree.changed.connect(self._refresh)
+        self.cbo_type.currentIndexChanged.connect(self._refresh)
+        self._refresh()
 
     def _capacity(self) -> int:
         return [CD_BYTES, DVD_BYTES, BD25_BYTES][self.cbo_type.currentIndex()]
 
-    def _refresh(self, files: List[str]):
+    def _refresh(self, *args):
         self.gauge.max_capacity = self._capacity()
-        self.gauge.update_size(compute_total_size(files))
+        self.gauge.update_size(self.tree.total_size())
 
     def _add_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Select Files")
-        for f in files:
-            self.list.add_path(f)
+        if files:
+            # Add into the selected folder if one is selected, else the root.
+            sel = self.tree.selectedItems()
+            parent = sel[0] if (sel and self.tree._is_dir(sel[0])) else None
+            self.tree.add_files(files, parent)
+
+    def _pick_folder(self) -> str:
+        """Open a folder chooser and return the selected path (or "").
+
+        On Windows this uses the classic Shell "Browse For Folder" dialog
+        (SHBrowseForFolder, old style: a compact folder tree with OK/Cancel), via
+        ctypes. On other platforms it falls back to Qt's directory chooser. GUI
+        only; nothing here touches the burn engine.
+        """
+        try:
+            from ..services.platform_caps import is_windows
+            win = is_windows()
+        except Exception:
+            win = False
+        if win:
+            try:
+                path = _shbrowseforfolder(self, "Select a folder to add to the disc")
+                return path or ""
+            except Exception:
+                pass  # fall back to Qt below
+        d = QFileDialog.getExistingDirectory(
+            self, "Select Folder", "",
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontUseNativeDialog,
+        )
+        return d or ""
 
     def _add_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Select Folder")
-        if d:
-            self.list.add_path(d)
+        d = self._pick_folder()
+        if not d:
+            return
+        folder = Path(d)
+        name = folder.name or str(folder)
+
+        # Ask how the folder should be placed on the disc. Adding the folder
+        # itself nests everything under a top-level folder; adding its contents
+        # places the folder's files and subfolders directly at the disc root.
+        box = QMessageBox(self)
+        box.setWindowTitle("Add Folder")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"How would you like to add \"{name}\" to the disc?")
+        box.setInformativeText(
+            "Add folder: the disc will contain a top-level folder named "
+            f"\"{name}\" holding all of its files and subfolders.\n\n"
+            "Add contents: the folder's files and subfolders will be placed "
+            "directly at the root of the disc."
+        )
+        btn_folder = box.addButton("Add Folder", QMessageBox.ButtonRole.AcceptRole)
+        btn_contents = box.addButton("Add Contents", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_folder)
+        box.exec()
+        clicked = box.clickedButton()
+        # Add into the selected folder if one is selected, else the disc root.
+        sel = self.tree.selectedItems()
+        parent = sel[0] if (sel and self.tree._is_dir(sel[0])) else None
+        if clicked is btn_folder:
+            self.tree.add_folder_as_folder(str(folder), parent)
+        elif clicked is btn_contents:
+            self.tree.add_folder_contents(str(folder), parent)
+
+    def _new_folder(self):
+        sel = self.tree.selectedItems()
+        parent = sel[0] if (sel and self.tree._is_dir(sel[0])) else None
+        item = self.tree.new_folder(parent)
+        self.tree.setCurrentItem(item)
+        self.tree.editItem(item, 0)  # let the user type the name immediately
+
+    def _rename(self):
+        sel = self.tree.selectedItems()
+        if not sel:
+            QMessageBox.information(self, "Rename", "Select an item to rename.")
+            return
+        self.tree.editItem(sel[0], 0)
 
     def _rm(self):
-        for it in self.list.selectedItems():
-            self.list.takeItem(self.list.row(it))
-        self._refresh(self.list.get_file_list())
+        self.tree.remove_selected()
+
+    def _clear(self):
+        self.tree.clear_all()
 
     def _warn_oversized_media(self, data_bytes: int, cap_bytes: int) -> bool:
         if data_bytes > 0 and cap_bytes >= 10 * data_bytes:
@@ -145,27 +363,9 @@ class DataBurnTab(BaseTab):
             return r == QMessageBox.StandardButton.Yes
         return True
 
-    def _confirm_blank_if_needed(self, device: str) -> bool:
-        if not self.chk_blank.isChecked():
-            return True
-        try:
-            media = MediaTools(self.tools, ProcessRunner())
-            info = media.get_info(device)
-            if info.get("rewritable") and info.get("blank") is False:
-                r = QMessageBox.question(self, "Blank Media?",
-                                         f"Rewritable media detected in {device}.\n"
-                                         f"This will ERASE all existing data.\n\n"
-                                         f"Continue with blanking?",
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                return r == QMessageBox.StandardButton.Yes
-        except Exception:
-            pass
-        return True
-
     def _start(self):
-        files = self.list.get_file_list()
-        if not files:
-            QMessageBox.warning(self, "No Files", "Add files or folders.")
+        if self.tree.is_empty():
+            QMessageBox.warning(self, "No Files", "Add files or folders to the disc.")
             return
         if self.gauge.current_size > self.gauge.max_capacity:
             r = QMessageBox.question(self, "Over Capacity", "Content exceeds disc capacity. Continue?",
@@ -174,7 +374,7 @@ class DataBurnTab(BaseTab):
                 return
         if not self._warn_oversized_media(self.gauge.current_size, self._capacity()):
             return
-        device = self.cfg.settings.get("default_device", "/dev/sr0")
+        device = self.selected_device()
         if not self._confirm_blank_if_needed(device):
             QMessageBox.information(self, "Cancelled", "Blanking cancelled. Job not queued.")
             return
@@ -189,22 +389,27 @@ class DataBurnTab(BaseTab):
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if r != QMessageBox.StandardButton.Yes:
                 return
+        disc_tree = self.tree.export_tree()
         job = Job(
             job_type=JobType.DATA,
-            files=[Path(p) for p in files],
+            files=[],
             device=device,
             options=JobOptions(
-                temp_dir=temp_dir, verify=self.chk_verify.isChecked(),
-                speed=self.cfg.settings.get("burn_speed", "Auto"),
+                temp_dir=temp_dir,
+                verify=self.cfg.drive_setting(device, "verify_after_burn", True),
+                speed=self.cfg.drive_setting(device, "burn_speed", "Auto"),
                 volume_label=self.ed_vol.text().strip() or "DATA_DISC",
-                auto_blank=self.chk_blank.isChecked(),
-                eject_after=self.chk_eject.isChecked(),
-                dummy=self.chk_dummy.isChecked(),
+                auto_blank=self.cfg.drive_setting(device, "auto_blank_rw", True),
+                eject_after=self.cfg.drive_setting(device, "eject_after_burn", True),
+                dummy=False,
+                disc_tree=disc_tree,
             ),
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
+        # Job start is shown non-modally in the status line and the Queue tab;
+        # no blocking popup is needed.
+        self.status.setText(f"Started: {job.display_name}")
 
 
 class AudioCDTab(BaseTab):
@@ -214,6 +419,7 @@ class AudioCDTab(BaseTab):
         title = QLabel("Create Audio CD")
         title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         lay.addWidget(title)
+        lay.addWidget(self._make_drive_row())
         self.list = FileListWidget(allow_dirs=False, exts=["mp3", "wav", "flac", "ogg", "m4a", "aac"])
         lay.addWidget(QLabel("Audio files (drag & drop):"))
         lay.addWidget(self.list)
@@ -244,9 +450,6 @@ class AudioCDTab(BaseTab):
         lay.addWidget(self.btn_guess)
         self.gauge = CapacityGauge(CD_BYTES, mode="minutes", max_minutes=80.0)
         lay.addWidget(self.gauge)
-        self.chk_eject = QCheckBox("Eject after burn")
-        self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
-        lay.addWidget(self.chk_eject)
         self.btn = QPushButton("Burn Audio CD")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
@@ -377,11 +580,11 @@ class AudioCDTab(BaseTab):
         job = Job(
             job_type=JobType.AUDIO,
             files=[Path(self.list.item(i).text()) for i in range(cnt)],
-            device=self.cfg.settings.get("default_device", "/dev/sr0"),
+            device=self.selected_device(),
             options=JobOptions(
                 temp_dir=temp_dir,
-                speed=self.cfg.settings.get("burn_speed", "Auto"),
-                eject_after=self.chk_eject.isChecked(),
+                speed=self.cfg.drive_setting(self.selected_device(), "burn_speed", "Auto"),
+                eject_after=self.cfg.drive_setting(self.selected_device(), "eject_after_burn", True),
                 album_title=self.ed_album.text().strip() or None,
                 album_performer=self.ed_artist.text().strip() or None,
                 track_titles=self.track_titles if self.track_titles else None,
@@ -389,7 +592,9 @@ class AudioCDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
+        # Job start is shown non-modally in the status line and the Queue tab;
+        # no blocking popup is needed.
+        self.status.setText(f"Started: {job.display_name}")
 
 
 class VideoDVDTab(BaseTab):
@@ -399,6 +604,7 @@ class VideoDVDTab(BaseTab):
         title = QLabel("Create Video DVD")
         title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         lay.addWidget(title)
+        lay.addWidget(self._make_drive_row())
         self.list = FileListWidget(allow_dirs=False, exts=["mp4", "avi", "mkv", "mov", "wmv", "flv"])
         lay.addWidget(QLabel("Video files (drag & drop):"))
         lay.addWidget(self.list)
@@ -414,12 +620,6 @@ class VideoDVDTab(BaseTab):
         lay.addLayout(row)
         self.gauge = CapacityGauge(DVD_BYTES, mode="minutes", max_minutes=dvd_max_minutes())
         lay.addWidget(self.gauge)
-        self.chk_blank = QCheckBox("Auto-blank RW media")
-        self.chk_blank.setChecked(bool(self.cfg.settings.get("auto_blank_rw", True)))
-        self.chk_eject = QCheckBox("Eject after burn")
-        self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
-        lay.addWidget(self.chk_blank)
-        lay.addWidget(self.chk_eject)
         self.btn = QPushButton("Burn Video DVD")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
@@ -471,23 +671,6 @@ class VideoDVDTab(BaseTab):
         self._dur_threads.add(thread)
         thread.start()
 
-    def _confirm_blank_if_needed(self, device: str) -> bool:
-        if not self.chk_blank.isChecked():
-            return True
-        try:
-            media = MediaTools(self.tools, ProcessRunner())
-            info = media.get_info(device)
-            if info.get("rewritable") and info.get("blank") is False:
-                r = QMessageBox.question(self, "Blank Media?",
-                                         f"Rewritable media detected in {device}.\n"
-                                         f"This will ERASE all existing data.\n\n"
-                                         f"Continue with blanking?",
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                return r == QMessageBox.StandardButton.Yes
-        except Exception:
-            pass
-        return True
-
     def _add(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Select Video Files", "", "Video (*.mp4 *.avi *.mkv *.mov *.wmv *.flv)")
         for f in files:
@@ -512,7 +695,7 @@ class VideoDVDTab(BaseTab):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if r != QMessageBox.StandardButton.Yes:
                 return
-        device = self.cfg.settings.get("default_device", "/dev/sr0")
+        device = self.selected_device()
         if not self._confirm_blank_if_needed(device):
             QMessageBox.information(self, "Cancelled", "Blanking cancelled. Job not queued.")
             return
@@ -534,11 +717,14 @@ class VideoDVDTab(BaseTab):
             files=[Path(self.list.item(i).text()) for i in range(self.list.count())],
             device=device,
             options=JobOptions(temp_dir=temp_dir, speed=self.cfg.settings.get("burn_speed", "Auto"),
-                               auto_blank=self.chk_blank.isChecked(), eject_after=self.chk_eject.isChecked()),
+                               auto_blank=self.cfg.drive_setting(device, "auto_blank_rw", True),
+                               eject_after=self.cfg.drive_setting(device, "eject_after_burn", True)),
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
+        # Job start is shown non-modally in the status line and the Queue tab;
+        # no blocking popup is needed.
+        self.status.setText(f"Started: {job.display_name}")
 
 
 class VideoBDTab(BaseTab):
@@ -548,6 +734,7 @@ class VideoBDTab(BaseTab):
         title = QLabel("Create Blu-ray (BDMV)")
         title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         lay.addWidget(title)
+        lay.addWidget(self._make_drive_row())
         self.list = FileListWidget(allow_dirs=False, exts=["mp4", "mkv", "mov", "ts", "m2ts"])
         lay.addWidget(QLabel("Video files (drag & drop):"))
         lay.addWidget(self.list)
@@ -563,12 +750,6 @@ class VideoBDTab(BaseTab):
         lay.addLayout(row)
         self.gauge = CapacityGauge(BD25_BYTES, mode="minutes", max_minutes=bd_max_minutes())
         lay.addWidget(self.gauge)
-        self.chk_blank = QCheckBox("Auto-blank RW media")
-        self.chk_blank.setChecked(bool(self.cfg.settings.get("auto_blank_rw", True)))
-        self.chk_eject = QCheckBox("Eject after burn")
-        self.chk_eject.setChecked(bool(self.cfg.settings.get("eject_after_burn", True)))
-        lay.addWidget(self.chk_blank)
-        lay.addWidget(self.chk_eject)
         self.btn = QPushButton("Burn Blu-ray")
         self.btn.clicked.connect(self._start)
         lay.addWidget(self.btn)
@@ -618,23 +799,6 @@ class VideoBDTab(BaseTab):
         self._dur_threads.add(thread)
         thread.start()
 
-    def _confirm_blank_if_needed(self, device: str) -> bool:
-        if not self.chk_blank.isChecked():
-            return True
-        try:
-            media = MediaTools(self.tools, ProcessRunner())
-            info = media.get_info(device)
-            if info.get("rewritable") and info.get("blank") is False:
-                r = QMessageBox.question(self, "Blank Media?",
-                                         f"Rewritable media detected in {device}.\n"
-                                         f"This will ERASE all existing data.\n\n"
-                                         f"Continue with blanking?",
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                return r == QMessageBox.StandardButton.Yes
-        except Exception:
-            pass
-        return True
-
     def _add(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Select Video Files", "", "Video (*.mp4 *.mkv *.mov *.ts *.m2ts)")
         for f in files:
@@ -659,7 +823,7 @@ class VideoBDTab(BaseTab):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if r != QMessageBox.StandardButton.Yes:
                 return
-        device = self.cfg.settings.get("default_device", "/dev/sr0")
+        device = self.selected_device()
         if not self._confirm_blank_if_needed(device):
             QMessageBox.information(self, "Cancelled", "Blanking cancelled. Job not queued.")
             return
@@ -680,11 +844,14 @@ class VideoBDTab(BaseTab):
             files=[Path(self.list.item(i).text()) for i in range(self.list.count())],
             device=device,
             options=JobOptions(temp_dir=temp_dir, speed=self.cfg.settings.get("burn_speed", "Auto"),
-                               auto_blank=self.chk_blank.isChecked(), eject_after=self.chk_eject.isChecked()),
+                               auto_blank=self.cfg.drive_setting(device, "auto_blank_rw", True),
+                               eject_after=self.cfg.drive_setting(device, "eject_after_burn", True)),
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
+        # Job start is shown non-modally in the status line and the Queue tab;
+        # no blocking popup is needed.
+        self.status.setText(f"Started: {job.display_name}")
 
 
 class RipCDTab(BaseTab):
@@ -695,6 +862,7 @@ class RipCDTab(BaseTab):
         title = QLabel("Rip Audio CD")
         title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
         lay.addWidget(title)
+        lay.addWidget(self._make_drive_row())
         opts = QGroupBox("Rip Options")
         form = QFormLayout()
         self.cbo_fmt = QComboBox()
@@ -760,7 +928,7 @@ class RipCDTab(BaseTab):
             self.track_titles = md.get("tracks") or []
             QMessageBox.information(self, "MusicBrainz", f"Found {len(self.track_titles)} track titles.")
 
-        th = MBThread(self.tools, self.cfg.settings.get("default_device", "/dev/sr0"))
+        th = MBThread(self.tools, self.selected_device())
         th.finished_data.connect(done)
         th.start()
         self._mb_thread = th  # hold ref
@@ -797,7 +965,7 @@ class RipCDTab(BaseTab):
         job = Job(
             job_type=JobType.RIP,
             files=[],
-            device=self.cfg.settings.get("default_device", "/dev/sr0"),
+            device=self.selected_device(),
             options=JobOptions(
                 temp_dir=Path(self.cfg.settings["temp_dir"]),
                 output_dir=out,
@@ -808,4 +976,6 @@ class RipCDTab(BaseTab):
         )
         self._register_job(job)
         self.queue.enqueue(job)
-        QMessageBox.information(self, "Started", f"Started: {job.display_name}\n\nProgress shows below and in the Queue tab. This runs immediately; no separate burn step is needed.")
+        # Job start is shown non-modally in the status line and the Queue tab;
+        # no blocking popup is needed.
+        self.status.setText(f"Started: {job.display_name}")
